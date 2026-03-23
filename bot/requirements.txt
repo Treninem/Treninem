@@ -1,0 +1,6 @@
+python-telegram-bot==20.7
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.7  # если используете PostgreSQL
+# или
+# sqlite3==3.38.0  # если используете SQLite (встроен)
+cryptography==41.0.7
