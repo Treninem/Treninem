@@ -4,7 +4,7 @@ from cryptography.fernet import Fernet
 import hashlib
 
 # Хешируем пароль администратора
-ADMIN_PASSWORD_HASH = hashlib.sha256("your_admin_password".encode()).hexdigest()
+ADMIN_PASSWORD_HASH = hashlib.sha256("230598".encode()).hexdigest()
 fernet = Fernet(SECRET_KEY.encode())
 
 def check_admin_password(password: str) -> bool:
