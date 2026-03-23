@@ -1,14 +1,16 @@
 import os
-from cryptography.fernet import Fernet
 
 # Токен бота от @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
+
 # URL базы данных (SQLite по умолчанию)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")
 
-# Секретный ключ для хеширования паролей
-SECRET_KEY = os.getenv("SECRET_KEY", Fernet.generate_key().decode())
+
+# Секретный ключ для админ‑доступа (простой текст)
+SECRET_KEY = os.getenv("SECRET_KEY", "your-simple-secret-key")
+
 
 # Настройки премиум‑подписки
 PREMIUM_BONUSES = {
