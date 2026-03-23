@@ -1,16 +1,15 @@
 from database import SessionLocal, User, Inventory
-from config import SECRET_KEY
-from cryptography.fernet import Fernet
 import hashlib
 
 # Хешируем пароль администратора
-ADMIN_PASSWORD_HASH = hashlib.sha256("230598".encode()).hexdigest()
-fernet = Fernet(SECRET_KEY.encode())
+ADMIN_PASSWORD_HASH = hashlib.sha256("your_admin_password".encode()).hexdigest()
 
 def check_admin_password(password: str) -> bool:
+    """Проверяет пароль администратора через SHA‑256"""
     return hashlib.sha256(password.encode()).hexdigest() == ADMIN_PASSWORD_HASH
 
 def get_stats() -> dict:
+    """Возвращает статистику по игре"""
     db = SessionLocal()
     try:
         users_count = db.query(User).count()
@@ -26,6 +25,7 @@ def get_stats() -> dict:
         db.close()
 
 def give_item(user_id: int, item_id: int, quantity: int) -> bool:
+    """Выдаёт предмет пользователю"""
     db = SessionLocal()
     try:
         inventory_item = db.query(Inventory).filter(
@@ -41,5 +41,9 @@ def give_item(user_id: int, item_id: int, quantity: int) -> bool:
 
         db.commit()
         return True
+    except Exception as e:
+        print(f"Ошибка выдачи предмета: {e}")
+        db.rollback()
+        return False
     finally:
         db.close()
