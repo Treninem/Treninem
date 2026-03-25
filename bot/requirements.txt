@@ -1,6 +1,0 @@
-aiohttp
-aiogram==3.0.0b7  # пример; уточните совместимость на платформе
-SQLAlchemy
-sqlite-utils
-passlib[bcrypt]  # для хешей паролей, если нужно
-python-dotenv
