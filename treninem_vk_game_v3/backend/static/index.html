@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Beast Legends by Treninem</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <meta name="theme-color" content="#10151d" />
+</head>
+<body>
+  <div class="ambient ambient-1"></div>
+  <div class="ambient ambient-2"></div>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-card glow-card">
+        <div class="brand-icon">🐾</div>
+        <div>
+          <h1>Beast Legends</h1>
+          <p>создатель: <strong>Treninem</strong></p>
+        </div>
+      </div>
+
+      <nav class="nav" id="navPanel">
+        <button data-screen="profile" class="nav-btn active">Профиль</button>
+        <button data-screen="inventory" class="nav-btn">Инвентарь</button>
+        <button data-screen="shop" class="nav-btn">Магазин</button>
+        <button data-screen="expedition" class="nav-btn">Экспедиции</button>
+        <button data-screen="dungeon" class="nav-btn">Подземелья</button>
+        <button data-screen="craft" class="nav-btn">Крафт</button>
+        <button data-screen="market" class="nav-btn">Рынок</button>
+        <button data-screen="bank" class="nav-btn">Банк</button>
+        <button data-screen="social" class="nav-btn">Друзья</button>
+        <button data-screen="leaderboard" class="nav-btn">Рейтинг</button>
+        <button data-screen="admin" class="nav-btn">Админка</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="inviteFriendsBtn" class="secondary-btn full">Пригласить друзей VK</button>
+        <button id="generateLinkBtn" class="secondary-btn full">Код для Android</button>
+        <div id="androidCodeBox" class="hint-box hidden"></div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div>
+          <div class="muted">VK Mini App / Android Sync / Live Service</div>
+          <h2 id="screenTitle">Профиль</h2>
+        </div>
+        <div class="top-actions">
+          <button id="syncBtn" class="secondary-btn">Обновить</button>
+          <button id="soundToggleBtn" class="secondary-btn">Звук: Вкл</button>
+        </div>
+      </header>
+
+      <section id="loginScreen" class="screen login-screen">
+        <div class="panel hero-panel glow-card">
+          <div>
+            <div class="hero-badge">НОВАЯ ВЕРСИЯ</div>
+            <h2>Погрузись в звериный мир с PvP, крафтом и рынком</h2>
+            <p>Красивая VK-версия с синхронизацией профиля, ежедневными наградами, заданиями, приглашениями друзей и закрытой админ-панелью.</p>
+            <div class="hero-list">
+              <div>✓ вход через VK Mini Apps</div>
+              <div>✓ ежедневные награды и квесты</div>
+              <div>✓ единый аккаунт для VK и Android</div>
+              <div>✓ автор мира: Treninem</div>
+            </div>
+          </div>
+          <div class="login-actions">
+            <button id="vkLoginBtn" class="primary-btn">Войти через VK</button>
+            <button id="devLoginBtn" class="secondary-btn">Dev-вход</button>
+            <label class="field">
+              <span>Dev VK ID</span>
+              <input id="devVkId" type="number" placeholder="123456789" />
+            </label>
+            <label class="field">
+              <span>Имя для dev-входа</span>
+              <input id="devDisplayName" type="text" placeholder="Treninem Dev" />
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section id="characterScreen" class="screen hidden">
+        <div class="panel glow-card" style="padding:20px;">
+          <h3>Выбери своего зверя</h3>
+          <div id="characterGrid" class="card-grid"></div>
+        </div>
+      </section>
+
+      <section id="appScreen" class="screen hidden">
+        <div id="profileScreen" class="subscreen"></div>
+        <div id="inventoryScreen" class="subscreen hidden"></div>
+        <div id="shopScreen" class="subscreen hidden"></div>
+        <div id="expeditionScreen" class="subscreen hidden"></div>
+        <div id="dungeonScreen" class="subscreen hidden"></div>
+        <div id="craftScreen" class="subscreen hidden"></div>
+        <div id="marketScreen" class="subscreen hidden"></div>
+        <div id="bankScreen" class="subscreen hidden"></div>
+        <div id="socialScreen" class="subscreen hidden"></div>
+        <div id="leaderboardScreen" class="subscreen hidden"></div>
+        <div id="adminScreen" class="subscreen hidden"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="mobile-nav" id="mobileNav">
+    <button data-screen="profile">Профиль</button>
+    <button data-screen="inventory">Сумка</button>
+    <button data-screen="shop">Шоп</button>
+    <button data-screen="market">Рынок</button>
+    <button data-screen="admin">Админ</button>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
