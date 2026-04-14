@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import re
 
 from config import RARITY_NAMES
 
@@ -33,6 +34,89 @@ SLOT_TITLES = {
     "accessory": "Аксессуар",
 }
 SLOT_ORDER = ["head", "body", "paws", "legs", "accessory"]
+
+
+FEMININE_NOUNS = {"похлёбка", "микстура", "сыворотка", "эссенция", "капсула", "настойка", "грамота", "хартия", "руда", "пыль", "пластина", "маска", "броня", "печать", "память"}
+PLURAL_NOUNS = {"наручи", "поножи", "перчатки"}
+
+
+def _adj_base(adj: str) -> str:
+    adj = adj.strip()
+    if adj.endswith('ий') or adj.endswith('ый') or adj.endswith('ой'):
+        return adj[:-2]
+    if adj.endswith('ыйый'):
+        return adj[:-4]
+    return adj
+
+
+def _adj_masc(adj: str) -> str:
+    adj = adj.strip()
+    if adj == 'Охотнич':
+        return 'Охотничий'
+    if adj.endswith(('ий', 'ый', 'ой')):
+        return adj
+    if adj.endswith('н') or adj.endswith('т') or adj.endswith('в') or adj.endswith('р') or adj.endswith('м') or adj.endswith('ск'):
+        return adj + 'ый'
+    return adj + 'ий'
+
+
+def _adj_fem(adj: str) -> str:
+    masc = _adj_masc(adj)
+    if masc.endswith('ий'):
+        return masc[:-2] + 'яя'
+    if masc.endswith('ой'):
+        return masc[:-2] + 'ая'
+    if masc.endswith('ый'):
+        return masc[:-2] + 'ая'
+    return masc
+
+
+def _adj_plural(adj: str) -> str:
+    masc = _adj_masc(adj)
+    if masc.endswith('ий'):
+        return masc[:-2] + 'ие'
+    if masc.endswith('ой') or masc.endswith('ый'):
+        return masc[:-2] + 'ые'
+    return masc
+
+
+def agree_adj(adj: str, noun_phrase: str) -> str:
+    noun_phrase = noun_phrase.strip()
+    first = noun_phrase.split()[0].lower()
+    if first in PLURAL_NOUNS:
+        ready = adj.endswith(('ые', 'ие'))
+        return f"{adj if ready else _adj_plural(adj)} {noun_phrase}"
+    if first in FEMININE_NOUNS:
+        ready = adj.endswith(('ая', 'яя'))
+        return f"{adj if ready else _adj_fem(adj)} {noun_phrase}"
+    ready = adj.endswith(('ий', 'ый', 'ой'))
+    return f"{adj if ready else _adj_masc(adj)} {noun_phrase}"
+
+
+def food_name(adj: str, pattern: str) -> str:
+    pattern = pattern.strip()
+    if pattern.startswith('ая '):
+        return f"{_adj_fem(adj)} {pattern[3:]}"
+    if pattern.startswith('ый '):
+        return f"{_adj_masc(adj)} {pattern[3:]}"
+    if pattern.startswith('ий '):
+        return f"{_adj_masc(adj)} {pattern[3:]}"
+    return agree_adj(adj, pattern)
+
+
+def normalize_item_name(name: str) -> str:
+    name = re.sub(r'\s+', ' ', name).strip()
+    fixes = {
+        'ыйый': 'ый', 'ийий': 'ий', 'ойой': 'ой',
+        'ыйая': 'ая', 'ийая': 'ая', 'ойая': 'ая',
+        'ыйяя': 'яя', 'ийяя': 'яя', 'аяяя': 'ая', 'яяяя': 'яя',
+        '  ': ' ',
+    }
+    for a, b in fixes.items():
+        name = name.replace(a, b)
+    name = name.replace('Охотнич шлем', 'Охотничий шлем')
+    name = name.replace('Охотнич доспех', 'Охотничий доспех')
+    return name
 
 
 def make_id(category: str, rarity: int, seq: int) -> int:
@@ -71,7 +155,7 @@ def add_item(
         "category_name": CATEGORY_NAMES[category],
         "rarity": rarity,
         "rarity_name": RARITY_NAMES[rarity],
-        "name": name,
+        "name": normalize_item_name(name),
         "emoji": emoji,
         "price": price,
         "weight": weight,
@@ -309,9 +393,9 @@ REFERRAL_REWARD_ITEMS: list[int] = []
 DAILY_TASK_POOL = []
 WEEKLY_TASK_POOL = []
 DEFAULT_MONETIZATION_PACKS = [
-    {"code": "starter_pack", "name": "Стартовый набор", "price_rub": 99, "reward": {"gold": 250, "premium": 3}},
-    {"code": "hunter_pass", "name": "Охотничий пропуск", "price_rub": 199, "reward": {"gold": 600, "premium": 8}},
-    {"code": "clan_bundle", "name": "Набор стаи", "price_rub": 299, "reward": {"gold": 900, "premium": 12}},
+    {"code": "starter_pack", "name": "Стартовый набор", "price_rub": 99, "price_stars": 35, "reward": {"gold": 220, "premium": 2}},
+    {"code": "hunter_pass", "name": "Охотничий пропуск", "price_rub": 199, "price_stars": 70, "reward": {"gold": 480, "premium": 5}},
+    {"code": "clan_bundle", "name": "Набор стаи", "price_rub": 299, "price_stars": 110, "reward": {"gold": 760, "premium": 8}},
 ]
 
 FOOD_ADJ = ["Лесн", "Дымн", "Пряный", "Сочный", "Тёплый", "Ягодный", "Грибной", "Речной", "Теневой", "Янтарный"]
@@ -344,7 +428,7 @@ for idx, (name, rarity, price) in enumerate([
 food_seq_start = 21
 for i in range(60):
     rarity = 1 + (i // 12)
-    name = f"{FOOD_ADJ[i % len(FOOD_ADJ)]}{FOOD_BASE[i % len(FOOD_BASE)]}".replace("ный", "ный")
+    name = food_name(FOOD_ADJ[i % len(FOOD_ADJ)], FOOD_BASE[i % len(FOOD_BASE)])
     add_item(
         "food", rarity, food_seq_start + i, name,
         emoji="🍖" if i % 2 == 0 else "🍓",
@@ -359,7 +443,7 @@ for i in range(60):
 material_seq_start = 21
 for i in range(60):
     rarity = 1 + (i // 12)
-    name = f"{MAT_ADJ[i % len(MAT_ADJ)]} {MAT_BASE[i % len(MAT_BASE)]}"
+    name = agree_adj(MAT_ADJ[i % len(MAT_ADJ)], MAT_BASE[i % len(MAT_BASE)])
     add_item(
         "material", rarity, material_seq_start + i, name,
         emoji="🪵" if i % 3 else "🪨",
@@ -374,7 +458,7 @@ equipment_seq_start = 1
 for i in range(60):
     rarity = 1 + (i // 12)
     slot = slots[i % len(slots)]
-    name = f"{EQUIP_ADJ[i % len(EQUIP_ADJ)]} {EQUIP_BASE[i % len(EQUIP_BASE)]}"
+    name = agree_adj(EQUIP_ADJ[i % len(EQUIP_ADJ)], EQUIP_BASE[i % len(EQUIP_BASE)])
     stats = {
         "attack": 1 + rarity + (1 if slot in {"paws", "accessory"} else 0),
         "defense": 1 + rarity + (1 if slot in {"body", "head"} else 0),
@@ -398,7 +482,7 @@ for i in range(60):
 elixir_seq_start = 1
 for i in range(60):
     rarity = 1 + (i // 12)
-    name = f"{ELIXIR_ADJ[i % len(ELIXIR_ADJ)]} {ELIXIR_BASE[i % len(ELIXIR_BASE)]}"
+    name = agree_adj(ELIXIR_ADJ[i % len(ELIXIR_ADJ)], ELIXIR_BASE[i % len(ELIXIR_BASE)])
     buffs = {
         "attack_pct": rarity * 2 if i % 5 == 0 else 0,
         "defense_pct": rarity * 2 if i % 5 == 1 else 0,
@@ -441,7 +525,7 @@ for i in range(60):
 recipe_seq_start = 1
 for i in range(60):
     rarity = 1 + (i // 12)
-    name = f"{RECIPE_ADJ[i % len(RECIPE_ADJ)]} {RECIPE_BASE[i % len(RECIPE_BASE)]} #{i+1}"
+    name = agree_adj(RECIPE_ADJ[i % len(RECIPE_ADJ)], f"{RECIPE_BASE[i % len(RECIPE_BASE)]} #{i+1}")
     add_item(
         "recipe", rarity, recipe_seq_start + i, name,
         emoji="📘",
@@ -458,7 +542,7 @@ EXTRA_FOOD_STYLE = ["Сытный", "Пикантный", "Копчёный", "�
 EXTRA_FOOD_KIND = ["суп", "пай", "батончик", "рагу", "желе", "настой", "пирог", "салат", "сухпаёк", "десерт"]
 for i in range(100):
     rarity = 1 + min(5, i // 17)
-    name = f"{EXTRA_FOOD_STYLE[i % len(EXTRA_FOOD_STYLE)]} {EXTRA_FOOD_KIND[(i * 3) % len(EXTRA_FOOD_KIND)]} №{i + 1}"
+    name = agree_adj(EXTRA_FOOD_STYLE[i % len(EXTRA_FOOD_STYLE)], f"{EXTRA_FOOD_KIND[(i * 3) % len(EXTRA_FOOD_KIND)]} №{i + 1}")
     buffs = {
         "attack_pct": rarity * 2 if i % 6 == 0 else 0,
         "defense_pct": rarity * 2 if i % 6 == 1 else 0,
@@ -484,7 +568,7 @@ EXTRA_MATERIAL_STYLE = ["Полярный", "Дикий", "Сумеречный"
 EXTRA_MATERIAL_KIND = ["осколок", "слиток", "волокно", "самоцвет", "панцирь", "сердечник", "корень", "руда", "пластина", "кокон"]
 for i in range(100):
     rarity = 1 + min(5, i // 17)
-    name = f"{EXTRA_MATERIAL_STYLE[i % len(EXTRA_MATERIAL_STYLE)]} {EXTRA_MATERIAL_KIND[(i * 2) % len(EXTRA_MATERIAL_KIND)]} №{i + 1}"
+    name = agree_adj(EXTRA_MATERIAL_STYLE[i % len(EXTRA_MATERIAL_STYLE)], f"{EXTRA_MATERIAL_KIND[(i * 2) % len(EXTRA_MATERIAL_KIND)]} №{i + 1}")
     add_item(
         "material", rarity, 261 + i, name,
         emoji="🧱" if i % 2 == 0 else "🪨",
@@ -500,7 +584,7 @@ extra_slots = ["head", "body", "paws", "legs", "accessory"]
 for i in range(100):
     rarity = 1 + min(5, i // 17)
     slot = extra_slots[i % len(extra_slots)]
-    name = f"{EXTRA_EQUIP_STYLE[i % len(EXTRA_EQUIP_STYLE)]} {EXTRA_EQUIP_KIND[(i * 2) % len(EXTRA_EQUIP_KIND)]} №{i + 1}"
+    name = agree_adj(EXTRA_EQUIP_STYLE[i % len(EXTRA_EQUIP_STYLE)], f"{EXTRA_EQUIP_KIND[(i * 2) % len(EXTRA_EQUIP_KIND)]} №{i + 1}")
     stats = {
         "hp": rarity * (8 if slot in {"head", "body"} else 4) + (i % 4),
         "energy": rarity * (6 if slot in {"legs", "accessory"} else 3) + (i % 3),
@@ -533,7 +617,7 @@ EXTRA_ELIXIR_STYLE = ["Вихревой", "Крепкий", "Точный", "Т�
 EXTRA_ELIXIR_KIND = ["эликсир", "настой", "тоник", "концентрат", "бальзам", "экстракт", "напиток", "состав", "порошок", "раствор"]
 for i in range(100):
     rarity = 1 + min(5, i // 17)
-    name = f"{EXTRA_ELIXIR_STYLE[i % len(EXTRA_ELIXIR_STYLE)]} {EXTRA_ELIXIR_KIND[(i * 3) % len(EXTRA_ELIXIR_KIND)]} №{i + 1}"
+    name = agree_adj(EXTRA_ELIXIR_STYLE[i % len(EXTRA_ELIXIR_STYLE)], f"{EXTRA_ELIXIR_KIND[(i * 3) % len(EXTRA_ELIXIR_KIND)]} №{i + 1}")
     buffs = {
         "attack_pct": rarity * 3 if i % 6 == 0 else 0,
         "defense_pct": rarity * 3 if i % 6 == 1 else 0,
@@ -604,7 +688,7 @@ CHEST_ID = add_item("scroll", 4, 203, "Запечатанный трофей", e
 DAILY_TASK_POOL.extend([
     {"code": "expeditions", "title": "Пройди экспедиции", "target": 2, "kind": "daily", "reward_gold": 28, "reward_xp": 30},
     {"code": "dungeons", "title": "Пройди подземелья", "target": 1, "kind": "daily", "reward_gold": 32, "reward_xp": 36},
-    {"code": "pvp", "title": "Проведи PvP-бои", "target": 2, "kind": "daily", "reward_gold": 26, "reward_xp": 34},
+    {"code": "pvp", "title": "Проведи бои на арене", "target": 2, "kind": "daily", "reward_gold": 26, "reward_xp": 34},
     {"code": "craft", "title": "Скрафти предметы", "target": 2, "kind": "daily", "reward_gold": 24, "reward_xp": 28},
     {"code": "buy_market", "title": "Купи на рынке", "target": 1, "kind": "daily", "reward_gold": 20, "reward_xp": 22},
     {"code": "gift", "title": "Подари предмет", "target": 1, "kind": "daily", "reward_gold": 22, "reward_xp": 22},

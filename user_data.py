@@ -23,6 +23,15 @@ from config import (
     START_PREMIUM,
     TALENT_RESET_PRICE,
     MAX_LEVEL,
+    PVP_BET_COMMISSION_RATE,
+    PVP_WINNER_BET_SHARE_RATE,
+    PVP_LOSER_TRIBUTE_RATE,
+    PVP_LOSER_TRIBUTE_CAP,
+    PVP_AUTO_TROPHY_BASE_RATE,
+    PVP_AUTO_TROPHY_MIN_VALUE,
+    PVP_AUTO_TROPHY_MAX_VALUE,
+    PVP_AUTO_TROPHY_CURRENCY_RESERVE_RATE,
+    PVP_DEBT_TERM_HOURS,
 )
 from data_items import CURRENCY_ID, ITEMS, PREMIUM_ID, SLOT_ORDER, CATEGORY_NAMES, get_item, is_equipment
 
@@ -57,6 +66,12 @@ def parse_json(value: str | None, default: Any) -> Any:
         return json.loads(value)
     except Exception:
         return default
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 # -----------------------------
@@ -167,7 +182,34 @@ def init_db() -> None:
                 ranked INTEGER DEFAULT 1,
                 status TEXT DEFAULT 'pending',
                 created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+                expires_at INTEGER NOT NULL,
+                chat_id INTEGER DEFAULT 0,
+                message_id INTEGER DEFAULT 0,
+                stake_mode TEXT DEFAULT 'auto',
+                stake_payload_json TEXT DEFAULT '[]',
+                stake_value INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS pvp_bets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                pick_user INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pvp_debts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                debtor_user INTEGER NOT NULL,
+                creditor_user INTEGER NOT NULL,
+                amount_gold INTEGER NOT NULL,
+                paid_gold INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'open',
+                reason TEXT DEFAULT '',
+                due_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS deals (
@@ -382,6 +424,13 @@ def init_db() -> None:
             """
         )
         cur.execute("INSERT OR IGNORE INTO admins(user_id, created_at) VALUES (?, ?)", (OWNER_ID, now_ts()))
+        ensure_column(conn, 'pvp_requests', 'chat_id', 'INTEGER DEFAULT 0')
+        ensure_column(conn, 'pvp_requests', 'message_id', 'INTEGER DEFAULT 0')
+        ensure_column(conn, 'pvp_requests', 'stake_mode', "TEXT DEFAULT 'auto'")
+        ensure_column(conn, 'pvp_requests', 'stake_payload_json', "TEXT DEFAULT '[]'")
+        ensure_column(conn, 'pvp_requests', 'stake_value', 'INTEGER DEFAULT 0')
+        ensure_column(conn, 'monetization_packs', 'price_stars', 'INTEGER DEFAULT 0')
+        ensure_column(conn, 'monetization_packs', 'stars_enabled', 'INTEGER DEFAULT 0')
 
 
 # -----------------------------
@@ -967,11 +1016,45 @@ def get_friends(user_id: int) -> list[int]:
         return [int(r[0]) for r in rows]
 
 
-def create_pvp_request(from_user: int, to_user: int, stake_gold: int, ranked: bool, expires_at: int) -> int:
+def pvp_package_value(payload: list[dict[str, Any]] | None) -> int:
+    total = 0
+    for row in payload or []:
+        item_id = int(row.get('item_id', 0) or 0)
+        amount = int(row.get('amount', 0) or 0)
+        item = get_item(item_id)
+        unit_price = max(1, int(item.get('price', 1)))
+        total += unit_price * max(0, amount)
+    return int(total)
+
+
+def create_pvp_request(
+    from_user: int,
+    to_user: int,
+    stake_gold: int,
+    ranked: bool,
+    expires_at: int,
+    chat_id: int = 0,
+    message_id: int = 0,
+    stake_mode: str = 'auto',
+    stake_payload: list[dict[str, Any]] | None = None,
+) -> int:
+    payload = stake_payload or []
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO pvp_requests(from_user, to_user, stake_gold, ranked, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (from_user, to_user, stake_gold, 1 if ranked else 0, now_ts(), expires_at),
+            "INSERT INTO pvp_requests(from_user, to_user, stake_gold, ranked, created_at, expires_at, chat_id, message_id, stake_mode, stake_payload_json, stake_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                from_user,
+                to_user,
+                stake_gold,
+                1 if ranked else 0,
+                now_ts(),
+                expires_at,
+                chat_id,
+                message_id,
+                stake_mode,
+                json.dumps(payload, ensure_ascii=False),
+                pvp_package_value(payload),
+            ),
         )
         return int(cur.lastrowid)
 
@@ -982,9 +1065,232 @@ def get_pvp_request(request_id: int) -> dict[str, Any] | None:
         return row_to_dict(row)
 
 
+def get_latest_chat_pvp(chat_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM pvp_requests WHERE chat_id = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 1",
+            (chat_id, now_ts()),
+        ).fetchone()
+        return row_to_dict(row)
+
+
+def get_pvp_request_by_message(chat_id: int, message_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM pvp_requests WHERE chat_id = ? AND message_id = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 1",
+            (chat_id, message_id, now_ts()),
+        ).fetchone()
+        return row_to_dict(row)
+
+
+def update_pvp_request_message(request_id: int, chat_id: int, message_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE pvp_requests SET chat_id = ?, message_id = ? WHERE id = ?", (chat_id, message_id, request_id))
+
+
 def set_pvp_request_status(request_id: int, status: str) -> None:
     with get_conn() as conn:
         conn.execute("UPDATE pvp_requests SET status = ? WHERE id = ?", (status, request_id))
+
+
+def create_pvp_bet(user_id: int, request_id: int, pick_user: int, item_id: int, amount: int) -> tuple[bool, str]:
+    req = get_pvp_request(request_id)
+    if not req or req.get('status') != 'pending' or int(req.get('expires_at', 0)) <= now_ts():
+        return False, 'Эта дуэль уже закрыта.'
+    if user_id in {int(req['from_user']), int(req['to_user'])}:
+        return False, 'Участники дуэли не могут ставить на свой бой.'
+    if pick_user not in {int(req['from_user']), int(req['to_user'])}:
+        return False, 'Неверная сторона ставки.'
+    if amount <= 0:
+        return False, 'Ставка должна быть больше нуля.'
+    if not remove_item(user_id, item_id, amount):
+        return False, 'Не хватает предметов или валюты для ставки.'
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO pvp_bets(request_id, user_id, pick_user, item_id, amount, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (request_id, user_id, pick_user, item_id, amount, now_ts()),
+        )
+    add_log(user_id, 'pvp_bet', f'Ставка на дуэль #{request_id}: предмет [{item_id}] x{amount} на игрока {pick_user}.')
+    return True, 'Ставка принята.'
+
+
+def get_pvp_bets(request_id: int) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM pvp_bets WHERE request_id = ? ORDER BY id", (request_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_pvp_debt(debtor_user: int, creditor_user: int, amount_gold: int, reason: str = '') -> int:
+    amount_gold = max(0, int(amount_gold))
+    if amount_gold <= 0:
+        return 0
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO pvp_debts(debtor_user, creditor_user, amount_gold, paid_gold, status, reason, due_at, created_at) VALUES (?, ?, ?, 0, 'open', ?, ?, ?)",
+            (debtor_user, creditor_user, amount_gold, reason, now_ts() + PVP_DEBT_TERM_HOURS * 3600, now_ts()),
+        )
+        return int(cur.lastrowid)
+
+
+def list_pvp_debts(user_id: int, mode: str = 'all') -> list[dict[str, Any]]:
+    where = []
+    args: list[Any] = []
+    if mode == 'debtor':
+        where.append('debtor_user = ?')
+        args.append(user_id)
+    elif mode == 'creditor':
+        where.append('creditor_user = ?')
+        args.append(user_id)
+    else:
+        where.append('(debtor_user = ? OR creditor_user = ?)')
+        args.extend([user_id, user_id])
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM pvp_debts WHERE {' AND '.join(where)} ORDER BY status = 'open' DESC, created_at DESC",
+            tuple(args),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _surplus_transferable_amount(item_id: int, amount: int) -> int:
+    item = get_item(item_id)
+    cat = item['category']
+    if item_id == PREMIUM_ID:
+        return 0
+    if item_id == CURRENCY_ID:
+        reserve = max(60, int(amount * PVP_AUTO_TROPHY_CURRENCY_RESERVE_RATE))
+        return max(0, amount - reserve)
+    if cat == 'material':
+        reserve = max(12, int(amount * 0.65))
+    elif cat in {'food', 'elixir', 'scroll'}:
+        reserve = max(5, int(amount * 0.70))
+    elif cat == 'recipe':
+        reserve = max(1, int(amount * 0.80))
+    elif cat == 'equipment':
+        reserve = 1
+    else:
+        reserve = 0
+    return max(0, amount - reserve)
+
+
+def _surplus_priority(item_id: int) -> tuple[int, int]:
+    item = get_item(item_id)
+    cat = item['category']
+    pri = {
+        'material': 1,
+        'food': 2,
+        'elixir': 3,
+        'scroll': 4,
+        'currency': 5,
+        'recipe': 6,
+        'equipment': 7,
+    }.get(cat, 9)
+    return pri, max(1, int(item.get('price', 1)))
+
+
+def take_pvp_tribute(loser_id: int, winner_id: int, winner_luck: int = 0, loser_luck: int = 0) -> dict[str, Any]:
+    inv = [row for row in get_inventory(loser_id) if int(row['item_id']) not in {PREMIUM_ID}]
+    if not inv:
+        return {'items': [], 'value': 0, 'debt_gold': 0, 'loan_used': 0}
+    wealth = 0
+    candidates: list[dict[str, Any]] = []
+    for row in inv:
+        item_id = int(row['item_id'])
+        amount = int(row['amount'])
+        item = row['item']
+        unit_value = max(1, int(item.get('price', 1)))
+        wealth += unit_value * amount
+        transferable = _surplus_transferable_amount(item_id, amount)
+        if transferable <= 0:
+            continue
+        candidates.append({
+            'item_id': item_id,
+            'amount': amount,
+            'transferable': transferable,
+            'unit_value': unit_value,
+            'priority': _surplus_priority(item_id),
+            'item': item,
+        })
+    if not candidates:
+        return {'items': [], 'value': 0, 'debt_gold': 0, 'loan_used': 0}
+    luck_shift = max(-0.12, min(0.12, (int(winner_luck) - int(loser_luck)) / 600))
+    target_value = int(wealth * (PVP_AUTO_TROPHY_BASE_RATE + luck_shift))
+    target_value = max(PVP_AUTO_TROPHY_MIN_VALUE, min(PVP_AUTO_TROPHY_MAX_VALUE, target_value))
+    candidates.sort(key=lambda row: (row['priority'][0], row['priority'][1], -row['transferable']))
+    moved: list[dict[str, Any]] = []
+    moved_value = 0
+    remaining = target_value
+    for row in candidates:
+        if remaining <= 0:
+            break
+        qty = min(row['transferable'], max(1, remaining // row['unit_value']))
+        if remaining > 0 and qty * row['unit_value'] < remaining and row['transferable'] > qty:
+            qty = min(row['transferable'], qty + 1)
+        if qty <= 0:
+            continue
+        if transfer_item(loser_id, winner_id, int(row['item_id']), int(qty)):
+            value = qty * row['unit_value']
+            moved.append({'item_id': int(row['item_id']), 'amount': int(qty), 'value': value})
+            moved_value += value
+            remaining = max(0, target_value - moved_value)
+    debt_gold = 0
+    loan_used = 0
+    if moved_value < target_value:
+        shortfall = target_value - moved_value
+        player = get_player(loser_id) or {}
+        if int(player.get('bank_debt', 0)) <= 0:
+            from game_logic import loan_offer
+            offer = loan_offer(player)
+            if int(offer.get('amount', 0)) >= shortfall:
+                ok, _ = create_loan(loser_id, shortfall)
+                if ok and transfer_item(loser_id, winner_id, CURRENCY_ID, shortfall):
+                    loan_used = shortfall
+                    moved.append({'item_id': CURRENCY_ID, 'amount': shortfall, 'value': shortfall})
+                    moved_value += shortfall
+                    shortfall = 0
+        if shortfall > 0:
+            create_pvp_debt(loser_id, winner_id, shortfall, 'Дуэльный долг за недостающий трофей')
+            debt_gold = shortfall
+    return {'items': moved, 'value': moved_value, 'debt_gold': debt_gold, 'loan_used': loan_used}
+
+
+def settle_pvp_bets(request_id: int, actual_winner_id: int) -> dict[str, Any]:
+    req = get_pvp_request(request_id)
+    if not req:
+        return {'hero_share': [], 'bettors': []}
+    bets = get_pvp_bets(request_id)
+    by_item: dict[int, list[dict[str, Any]]] = {}
+    for bet in bets:
+        by_item.setdefault(int(bet['item_id']), []).append(bet)
+    hero_rewards: list[dict[str, Any]] = []
+    bettor_rewards: list[dict[str, Any]] = []
+    for item_id, rows in by_item.items():
+        winning_rows = [r for r in rows if int(r['pick_user']) == int(actual_winner_id)]
+        losing_rows = [r for r in rows if int(r['pick_user']) != int(actual_winner_id)]
+        total_w = sum(int(r['amount']) for r in winning_rows)
+        total_l = sum(int(r['amount']) for r in losing_rows)
+        hero_share = int(total_l * PVP_WINNER_BET_SHARE_RATE) if total_l else 0
+        commission = int(total_l * PVP_BET_COMMISSION_RATE) if total_l else 0
+        distributable = max(0, total_l - hero_share - commission)
+        paid_out = 0
+        if winning_rows and total_w > 0:
+            for idx, row in enumerate(winning_rows, start=1):
+                own_back = int(row['amount'])
+                if idx == len(winning_rows):
+                    bonus = max(0, distributable - paid_out)
+                else:
+                    bonus = int(distributable * own_back / total_w) if distributable else 0
+                    paid_out += bonus
+                payout = own_back + bonus
+                if payout > 0:
+                    add_item(int(row['user_id']), item_id, payout)
+                    bettor_rewards.append({'user_id': int(row['user_id']), 'item_id': item_id, 'amount': payout})
+        else:
+            hero_share += distributable
+        if hero_share > 0:
+            add_item(actual_winner_id, item_id, hero_share)
+            hero_rewards.append({'item_id': item_id, 'amount': hero_share})
+    return {'hero_share': hero_rewards, 'bettors': bettor_rewards}
 
 
 def create_deal(from_user: int, to_user: int, offer_item: int, offer_amount: int, want_item: int, want_amount: int, expires_at: int) -> int:
@@ -1607,8 +1913,15 @@ def ensure_default_packs(defaults: list[dict[str, Any]]) -> None:
     with get_conn() as conn:
         for pack in defaults:
             conn.execute(
-                "INSERT OR IGNORE INTO monetization_packs(code, name, price_rub, reward_json, enabled, stock) VALUES (?, ?, ?, ?, 1, 0)",
-                (pack["code"], pack["name"], pack["price_rub"], json.dumps(pack["reward"], ensure_ascii=False)),
+                "INSERT OR IGNORE INTO monetization_packs(code, name, price_rub, reward_json, enabled, stock, price_stars, stars_enabled) VALUES (?, ?, ?, ?, 1, 0, ?, ?)",
+                (
+                    pack["code"],
+                    pack["name"],
+                    pack["price_rub"],
+                    json.dumps(pack["reward"], ensure_ascii=False),
+                    int(pack.get("price_stars", 0) or 0),
+                    1 if int(pack.get("price_stars", 0) or 0) > 0 else 0,
+                ),
             )
 
 
@@ -1626,6 +1939,71 @@ def toggle_pack(code: str) -> tuple[bool, str]:
         new_val = 0 if int(row[0]) else 1
         conn.execute("UPDATE monetization_packs SET enabled = ? WHERE code = ?", (new_val, code))
         return True, "Пак обновлён."
+
+def toggle_pack_stars(code: str) -> tuple[bool, str]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT stars_enabled, price_stars FROM monetization_packs WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return False, "Пак не найден."
+        if int(row['price_stars'] if isinstance(row, sqlite3.Row) else row[1]) <= 0:
+            return False, "Сначала укажи цену в звёздах для этого пака."
+        current = int(row['stars_enabled'] if isinstance(row, sqlite3.Row) else row[0])
+        new_val = 0 if current else 1
+        conn.execute("UPDATE monetization_packs SET stars_enabled = ? WHERE code = ?", (new_val, code))
+        return True, "Продажа за звёзды обновлена."
+
+
+def set_pack_stars_price(code: str, price_stars: int) -> tuple[bool, str]:
+    price_stars = max(0, int(price_stars))
+    with get_conn() as conn:
+        row = conn.execute("SELECT code FROM monetization_packs WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return False, "Пак не найден."
+        conn.execute("UPDATE monetization_packs SET price_stars = ?, stars_enabled = ? WHERE code = ?", (price_stars, 1 if price_stars > 0 else 0, code))
+        return True, "Цена в звёздах сохранена."
+
+
+def donation_enabled() -> bool:
+    state = get_world_state('donation_settings', {}) or {}
+    return bool(state.get('enabled', 0))
+
+
+def toggle_donation_enabled() -> tuple[bool, str]:
+    state = get_world_state('donation_settings', {}) or {}
+    new_val = 0 if state.get('enabled') else 1
+    state['enabled'] = new_val
+    set_world_state('donation_settings', state)
+    return True, 'Донат включён.' if new_val else 'Донат выключен.'
+
+
+def set_bank_debt_admin(user_id: int, target_debt: int) -> tuple[bool, str]:
+    player = get_player(user_id)
+    if not player:
+        return False, 'Игрок не найден.'
+    target_debt = max(0, int(target_debt))
+    due_ts = now_ts() + 72 * 3600 if target_debt > 0 else 0
+    with get_conn() as conn:
+        conn.execute("UPDATE players SET bank_debt = ?, bank_due_ts = ? WHERE user_id = ?", (target_debt, due_ts, user_id))
+    if target_debt > 0:
+        return True, f'Банковский долг игрока установлен: {target_debt} монет.'
+    return True, 'Банковский долг полностью аннулирован.'
+
+
+def reduce_bank_debt_admin(user_id: int, amount: int) -> tuple[bool, str]:
+    player = get_player(user_id)
+    if not player:
+        return False, 'Игрок не найден.'
+    amount = max(0, int(amount))
+    current = int(player.get('bank_debt', 0))
+    new_val = max(0, current - amount)
+    due_ts = int(player.get('bank_due_ts', 0)) if new_val > 0 else 0
+    with get_conn() as conn:
+        conn.execute("UPDATE players SET bank_debt = ?, bank_due_ts = ? WHERE user_id = ?", (new_val, due_ts, user_id))
+    if new_val == current:
+        return True, 'Долг не изменился.'
+    if new_val == 0:
+        return True, 'Банковский долг полностью погашен админом.'
+    return True, f'Банковский долг уменьшен. Осталось: {new_val} монет.'
 
 
 def grant_pack_to_user(code: str, user_id: int) -> tuple[bool, str]:

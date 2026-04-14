@@ -9,10 +9,27 @@ from data_items import ITEMS, category_items, get_item
 RECIPES: dict[int, dict[str, Any]] = {}
 
 
+STATION_RECIPE_TITLES = {
+    'kitchen': 'Полевая кухня',
+    'forge': 'Кузница стаи',
+    'alchemy': 'Лисья алхимия',
+    'scribe': 'Тотемный свиток',
+    'craft': 'Мастерская троп',
+}
+
+
+def recipe_title(name: str, station: str, result: int) -> str:
+    result_name = get_item(result)['name'] if result in ITEMS else 'изделие'
+    generic = ('#' in name) or any(name.startswith(prefix) for prefix in ['Кухня ', 'Кузня ', 'Алхимия ', 'Руны ', 'Переплавка ', 'Набор ', 'Легендарная сборка ', 'Универсальный рецепт '])
+    if generic:
+        return f"{STATION_RECIPE_TITLES.get(station, 'Ремесло')}: {result_name}"
+    return name
+
+
 def add_recipe(recipe_id: int, name: str, result: int, result_amount: int, ingredients: dict[int, int], *, station: str = "craft", required_level: int = 1) -> None:
     RECIPES[recipe_id] = {
         "id": recipe_id,
-        "name": name,
+        "name": recipe_title(name, station, result),
         "result": result,
         "result_amount": result_amount,
         "ingredients": ingredients,

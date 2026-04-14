@@ -6,7 +6,7 @@
 - инвентарь, экипировка, крафт, магазин, чёрный рынок;
 - рынок, аукцион, заказы на покупку, подарки, сделки, просьбы;
 - PvP, подземелья, экспедиции, задания, мировой босс;
-- стаи, почта, питомцы, лагерь AFK, рефералка;
+- стаи, почта, питомцы, лагерь офлайн, рефералка;
 - owner-only админ-панель с заготовкой под монетизацию и анти-мультиаккаунт оповещения.
 """
 
@@ -26,7 +26,11 @@ from telebot.types import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    LabeledPrice,
 )
 
 from config import (
@@ -49,6 +53,8 @@ from config import (
     HELP_COMMANDS,
     COMMAND_RU_SYNONYMS,
     MAX_LEVEL,
+    PVP_BET_COMMISSION_RATE,
+    PVP_WINNER_BET_SHARE_RATE,
     INFO_TEXT,
     LORE_TEXT,
     MAP_TEXT,
@@ -109,6 +115,7 @@ from game_logic import (
     run_dungeon,
     run_expedition,
     season_info,
+    league_name,
     sync_level,
     world_boss_attack,
     world_boss_today,
@@ -178,10 +185,17 @@ from user_data import (
     get_player_extras,
     get_player_by_username,
     get_pvp_request,
+    get_latest_chat_pvp,
+    get_pvp_request_by_message,
+    get_pvp_bets,
     get_referrals,
     get_user_state,
     get_world_state,
     grant_pack_to_user,
+    create_pvp_bet,
+    update_pvp_request_message,
+    take_pvp_tribute,
+    settle_pvp_bets,
     init_db,
     load_custom_items,
     load_custom_recipes,
@@ -190,6 +204,12 @@ from user_data import (
     join_clan,
     leave_clan,
     list_admins,
+    donation_enabled,
+    toggle_donation_enabled,
+    toggle_pack_stars,
+    set_pack_stars_price,
+    set_bank_debt_admin,
+    reduce_bank_debt_admin,
     list_auctions,
     list_buy_orders,
     list_clans,
@@ -259,6 +279,7 @@ def register_telegram_commands() -> None:
         BotCommand('menu', 'главное меню'),
         BotCommand('p', 'профиль'),
         BotCommand('inv', 'инвентарь'),
+        BotCommand('pvp', 'арена и дуэли'),
         BotCommand('x', 'экспедиция'),
         BotCommand('d', 'подземелье'),
         BotCommand('s', 'магазин'),
@@ -278,14 +299,17 @@ def register_telegram_commands() -> None:
         BotCommand('fac', 'фракция'),
         BotCommand('ct', 'контракты'),
         BotCommand('info', 'правила и помощь'),
+        BotCommand('donate', 'поддержка и звёзды'),
     ]
     group_commands = [
         BotCommand('menu', 'главное меню'),
         BotCommand('p', 'профиль'),
         BotCommand('inv', 'инвентарь'),
+        BotCommand('pvp', 'дуэли и ставки'),
         BotCommand('mk', 'рынок и обмен'),
         BotCommand('top', 'рейтинги'),
         BotCommand('info', 'правила и помощь'),
+        BotCommand('donate', 'поддержка и звёзды'),
     ]
     try:
         bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
@@ -472,6 +496,44 @@ load_runtime_custom_content()
 # -----------------------------
 
 LAST_UI_MESSAGE: dict[tuple[int, int], int] = {}
+LAST_PRIVATE_REPLY_KB: dict[int, float] = {}
+
+
+def private_reply_keyboard() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
+    kb.row(KeyboardButton('🏠 Меню'), KeyboardButton('👤 Профиль'), KeyboardButton('🎒 Инвентарь'))
+    kb.row(KeyboardButton('⚔️ Арена'), KeyboardButton('🧭 Экспедиция'), KeyboardButton('🏰 Подземелье'))
+    kb.row(KeyboardButton('🛒 Магазин'), KeyboardButton('📦 Рынок'), KeyboardButton('⚒ Крафт'))
+    kb.row(KeyboardButton('🏦 Банк'), KeyboardButton('🎯 Задания'), KeyboardButton('🌍 Босс'))
+    kb.row(KeyboardButton('🐾 Питомец'), KeyboardButton('⛺ Лагерь'), KeyboardButton('🐺 Стая'))
+    kb.row(KeyboardButton('🏛 Фракция'), KeyboardButton('🧬 Таланты'), KeyboardButton('🧾 Контракты'))
+    kb.row(KeyboardButton('✉️ Почта'), KeyboardButton('🏆 Топы'), KeyboardButton('🎁 Рефералка'))
+    kb.row(KeyboardButton('📘 Инфо'))
+    if OWNER_ID:
+        kb.row(KeyboardButton('🔐 Админ'))
+    return kb
+
+
+def ensure_private_reply_keyboard(target, force: bool = False) -> None:
+    try:
+        if hasattr(target, 'message'):
+            chat = target.message.chat
+            user_id = target.from_user.id
+        elif hasattr(target, 'chat') and hasattr(target, 'from_user'):
+            chat = target.chat
+            user_id = target.from_user.id
+        else:
+            return
+        if chat.type != 'private':
+            return
+        now = time.time()
+        if not force and now - LAST_PRIVATE_REPLY_KB.get(chat.id, 0) < 300:
+            return
+        msg = bot.send_message(chat.id, 'ㅤ', reply_markup=private_reply_keyboard())
+        LAST_PRIVATE_REPLY_KB[chat.id] = now
+        safe_delete(chat.id, msg.message_id, 1)
+    except Exception:
+        pass
 
 
 def ui_key_for_target(target) -> tuple[int, int] | None:
@@ -509,6 +571,15 @@ def resolve_item_query(query: str, categories: list[str] | None = None) -> tuple
             return None, 'Этот предмет не подходит для выбранного действия.'
         return item, None
     nq = normalize_lookup(query)
+    alias_map = {
+        'монета': CURRENCY_ID, 'монеты': CURRENCY_ID, 'монета стаи': CURRENCY_ID, 'валюта': CURRENCY_ID, 'золото': CURRENCY_ID,
+        'материал': None, 'материалы': None, 'ресурс': None, 'ресурсы': None,
+    }
+    if nq in alias_map and alias_map[nq]:
+        item = get_item(alias_map[nq])
+        if categories and item['category'] not in categories:
+            return None, 'Этот предмет не подходит для выбранного действия.'
+        return item, None
     pool = [item for item in ITEMS.values() if not categories or item['category'] in categories]
     scored: list[tuple[int, dict[str, Any]]] = []
     for item in pool:
@@ -612,6 +683,36 @@ def full_name_from_user(user) -> str:
     return " ".join([p for p in parts if p]).strip() or f"id{user.id}"
 
 
+LAST_REPLY_KEYBOARD_CLEAR: dict[tuple[int, int], float] = {}
+
+
+def clear_stale_reply_keyboard(target, force: bool = False) -> None:
+    """Удаляет старую reply-клавиатуру, если она осталась от прошлых версий бота.
+
+    Telegram хранит reply-клавиатуру на стороне клиента, поэтому одной смены кода мало.
+    Нужно один раз отправить сообщение с ReplyKeyboardRemove, после чего клавиатура исчезнет.
+    Сообщение сразу удаляется, чтобы не засорять чат.
+    """
+    try:
+        if hasattr(target, 'message'):
+            chat_id = target.message.chat.id
+            user_id = target.from_user.id
+        elif hasattr(target, 'chat') and hasattr(target, 'from_user'):
+            chat_id = target.chat.id
+            user_id = target.from_user.id
+        else:
+            return
+        key = (chat_id, user_id)
+        now = time.time()
+        if not force and now - LAST_REPLY_KEYBOARD_CLEAR.get(key, 0) < 300:
+            return
+        msg = bot.send_message(chat_id, 'ㅤ', reply_markup=ReplyKeyboardRemove())
+        LAST_REPLY_KEYBOARD_CLEAR[key] = now
+        safe_delete(chat_id, msg.message_id, 1)
+    except Exception:
+        pass
+
+
 def safe_delete(chat_id: int, message_id: int, delay: int = 0) -> None:
     def _work() -> None:
         try:
@@ -679,6 +780,46 @@ def extras_for_user(user_id: int) -> dict[str, Any]:
     return get_player_extras(user_id)
 
 
+def is_private_target(target) -> bool:
+    if hasattr(target, "chat"):
+        return getattr(target.chat, "type", "") == "private"
+    if hasattr(target, "message") and hasattr(target.message, "chat"):
+        return getattr(target.message.chat, "type", "") == "private"
+    return False
+
+
+def category_title_ru(key: str) -> str:
+    return CATEGORY_NAMES.get(key, str(key).replace('_', ' '))
+
+
+def group_hub_text() -> str:
+    return (
+        f"{GAME_TITLE} <b>{VERSION}</b>\n"
+        f"В групповом чате управление сделано текстом, чтобы не засорять переписку.\n\n"
+        f"<b>Быстрые команды:</b> /p /inv /pvp /mk /top /info\n"
+        f"<b>По-русски тоже работает:</b> профиль, инвентарь, пвп, рынок, топ, инфо\n\n"
+        f"<b>Дуэль:</b> <code>пвп @username</code> или ответь на сообщение словом <code>дуэль</code>.\n"
+        f"<b>Принятие:</b> ответь на карточку дуэли словом <code>принять</code> или <code>отклонить</code>.\n"
+        f"<b>Ставка:</b> ответь на карточку дуэли сообщением <code>ставка 50 монет @username</code>."
+    )
+
+
+def resolve_pvp_request_for_bet(message: Message) -> dict[str, Any] | None:
+    if message.reply_to_message:
+        req = get_pvp_request_by_message(message.chat.id, message.reply_to_message.message_id)
+        if req:
+            return req
+    return get_latest_chat_pvp(message.chat.id)
+
+
+def resolve_pending_pvp_request(message: Message) -> dict[str, Any] | None:
+    if message.reply_to_message:
+        req = get_pvp_request_by_message(message.chat.id, message.reply_to_message.message_id)
+        if req and req.get('status') == 'pending':
+            return req
+    return get_latest_chat_pvp(message.chat.id)
+
+
 def resolve_target_from_message(message: Message, text: str | None = None) -> dict[str, Any] | None:
     if message.reply_to_message and message.reply_to_message.from_user:
         return get_player(message.reply_to_message.from_user.id)
@@ -692,6 +833,48 @@ def resolve_target_from_message(message: Message, text: str | None = None) -> di
     return None
 
 
+def pvp_request_markup(req: dict[str, Any]) -> InlineKeyboardMarkup:
+    req_id = int(req['id'])
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton('✅ Принять', callback_data=f'pvp:accept:{req_id}'), InlineKeyboardButton('❌ Отклонить', callback_data=f'pvp:decline:{req_id}'))
+    kb.add(InlineKeyboardButton(f'📈 Ставка на {get_display_name(int(req["from_user"]))}', callback_data=f'pvp:bet:{req_id}:{int(req["from_user"])}'))
+    kb.add(InlineKeyboardButton(f'📉 Ставка на {get_display_name(int(req["to_user"]))}', callback_data=f'pvp:bet:{req_id}:{int(req["to_user"])}'))
+    return kb
+
+
+def render_pvp_card(req_id: int, for_private: bool = False) -> tuple[str, InlineKeyboardMarkup | None]:
+    req = get_pvp_request(req_id)
+    if not req:
+        return 'Дуэль не найдена.', None
+    a = get_player(int(req['from_user'])) or {}
+    d = get_player(int(req['to_user'])) or {}
+    bets = get_pvp_bets(req_id)
+    bet_lines: list[str] = []
+    if bets:
+        grouped: dict[tuple[int, int], int] = {}
+        for bet in bets:
+            key = (int(bet['pick_user']), int(bet['item_id']))
+            grouped[key] = grouped.get(key, 0) + int(bet['amount'])
+        for (pick_user, item_id), amount in list(grouped.items())[:8]:
+            item = get_item(item_id)
+            bet_lines.append(f"• на {get_display_name(pick_user)}: {item['emoji']} {item['name']} x{amount}")
+    else:
+        bet_lines.append('• Ставок пока нет.')
+    text = (
+        f"⚔️ <b>Дуэль #{req_id}</b>\n"
+        f"{get_display_name(int(req['from_user']))} — рейтинг {int(a.get('rating', 1000))} · {league_name(int(a.get('rating', 1000)))}\n"
+        f"против\n"
+        f"{get_display_name(int(req['to_user']))} — рейтинг {int(d.get('rating', 1000))} · {league_name(int(d.get('rating', 1000)))}\n\n"
+        f"Статус: {'ожидание ответа' if req.get('status') == 'pending' else req.get('status')}\n"
+        f"Режим дуэли: безопасный трофей из излишков инвентаря проигравшего.\n"
+        f"Одиночные редкие вещи и последний экземпляр экипировки не изымаются автоматически.\n"
+        f"Ставки зрителей: комиссия {int(PVP_BET_COMMISSION_RATE * 100)}% · доля победителю {int(PVP_WINNER_BET_SHARE_RATE * 100)}%\n"
+        f"Разрешены: валюта и материалы.\n\n"
+        f"<b>Текущие ставки:</b>\n" + '\n'.join(bet_lines)
+    )
+    if for_private:
+        return text, pvp_request_markup(req)
+    return text, None
 def owner_alert(text: str) -> None:
     try:
         bot.send_message(OWNER_ID, f"🚨 <b>Подозрение</b>\n{text}")
@@ -984,8 +1167,15 @@ def reward_player(user_id: int, gold: int, xp: int, loot: list[tuple[int, int]],
 
 
 def open_main(target) -> None:
+    if hasattr(target, 'chat') and getattr(target.chat, 'type', '') == 'private':
+        ensure_private_reply_keyboard(target)
+    else:
+        clear_stale_reply_keyboard(target)
     uid = target.from_user.id if hasattr(target, "from_user") else target.message.from_user.id
-    edit_or_send(target, f"{GAME_TITLE} <b>{VERSION}</b>\nВыбирай раздел ниже.", main_menu(uid))
+    if is_private_target(target):
+        edit_or_send(target, f"{GAME_TITLE} <b>{VERSION}</b>\nВыбирай раздел ниже.", main_menu(uid))
+    else:
+        edit_or_send(target, group_hub_text(), None)
 
 
 # -----------------------------
@@ -1010,6 +1200,7 @@ def main_menu(uid: int) -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton("👤 Профиль", callback_data="menu:profile"),
         InlineKeyboardButton("🎒 Инвентарь", callback_data="menu:inv:0"),
+        InlineKeyboardButton("⚔️ Арена", callback_data="menu:pvp"),
         InlineKeyboardButton("🧬 Таланты", callback_data="menu:tal"),
         InlineKeyboardButton("🏛 Фракция", callback_data="menu:faction"),
         InlineKeyboardButton("🧾 Контракты", callback_data="menu:contracts"),
@@ -1073,9 +1264,19 @@ def top_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("⭐ Уровни", callback_data="top:lvl"),
-        InlineKeyboardButton("⚔️ PvP", callback_data="top:pvp"),
+        InlineKeyboardButton("⚔️ Арена", callback_data="top:pvp"),
         InlineKeyboardButton("💰 Богачи", callback_data="top:rich"),
         InlineKeyboardButton("🤝 Репутация", callback_data="top:rep"),
+        InlineKeyboardButton("⬅️ В меню", callback_data="menu:main"),
+    )
+    return kb
+
+
+def pvp_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🏆 Топ арены", callback_data="top:pvp"),
+        InlineKeyboardButton("📜 Как вызвать", callback_data="pvp:guide"),
         InlineKeyboardButton("⬅️ В меню", callback_data="menu:main"),
     )
     return kb
@@ -1186,6 +1387,8 @@ def admin_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🎁 Выдать пак", callback_data="admin:pack_menu"),
         InlineKeyboardButton("🎒 Выдать предмет", callback_data="admin:give_menu"),
         InlineKeyboardButton("🗑 Забрать предмет", callback_data="admin:take_menu"),
+        InlineKeyboardButton("🏦 Долг банка", callback_data="state:admin_bank_debt"),
+        InlineKeyboardButton("💫 Донат", callback_data="admin:donate"),
         InlineKeyboardButton("⭐ Уровень", callback_data="state:admin_level"),
         InlineKeyboardButton("⛔ Блок", callback_data="state:admin_block"),
         InlineKeyboardButton("✅ Разблок", callback_data="state:admin_unblock"),
@@ -1391,7 +1594,7 @@ def show_profile(target, uid: int) -> None:
         f"Поединки: {p['wins']} / {p['losses']}\n"
         f"Сезон #{season['season_no']} · осталось {season['days_left']} дн."
     )
-    edit_or_send(target, text, profile_menu(p))
+    edit_or_send(target, text, profile_menu(p) if is_private_target(target) else None)
 
 
 def show_gear(target, uid: int) -> None:
@@ -1406,7 +1609,7 @@ def show_gear(target, uid: int) -> None:
         else:
             lines.append(f"• {SLOT_TITLES[slot]}: —")
     kb.add(InlineKeyboardButton("🔧 Починить всё", callback_data="gear:repair"), InlineKeyboardButton("⬅️ Профиль", callback_data="menu:profile"))
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_inventory(target, uid: int, category: str = "all", page: int = 0) -> None:
@@ -1435,7 +1638,7 @@ def show_inventory(target, uid: int, category: str = "all", page: int = 0) -> No
     # merge buttons
     for row in cats.keyboard:
         kb.keyboard.append(row)
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_item(target, uid: int, item_id: int, back_cat: str, back_page: int) -> None:
@@ -1457,7 +1660,7 @@ def show_shop(target, black: bool = False, page: int = 0) -> None:
     title = "🌑 <b>Чёрный рынок</b>" if black else "🛒 <b>Магазин</b>"
     per_page = 6
     chunk = stock[page*per_page:(page+1)*per_page]
-    lines = [title, f"Тренд дня: спрос на {eco['demand']} · избыток {eco['surplus']}", ""]
+    lines = [title, f"Тренд дня: спрос на {category_title_ru(eco['demand'])} · избыток {category_title_ru(eco['surplus'])}", ""]
     kb = InlineKeyboardMarkup(row_width=1)
     for row in chunk:
         item = get_item(row['item_id'])
@@ -1471,7 +1674,7 @@ def show_shop(target, black: bool = False, page: int = 0) -> None:
     if nav:
         kb.row(*nav)
     kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="menu:main"))
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_craft(target, uid: int, page: int = 0) -> None:
@@ -1496,7 +1699,10 @@ def show_craft(target, uid: int, page: int = 0) -> None:
 
 
 def show_market_root(target) -> None:
-    edit_or_send(target, "📦 <b>Рынок и обмен</b>", market_menu())
+    text = "📦 <b>Рынок и обмен</b>"
+    if not is_private_target(target):
+        text += "\nВ группе используй текстовые действия: подарок, сделка, запрос, рынок, аукцион. Для выбора предметов удобнее открыть ЛС с ботом."
+    edit_or_send(target, text, market_menu() if is_private_target(target) else None)
 
 
 def show_market_list(target, page: int = 0) -> None:
@@ -1520,7 +1726,7 @@ def show_market_list(target, page: int = 0) -> None:
     if nav:
         kb.row(*nav)
     kb.add(InlineKeyboardButton("⬅️ К рынку", callback_data="menu:market"))
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_auctions(target, page: int = 0) -> None:
@@ -1543,7 +1749,7 @@ def show_auctions(target, page: int = 0) -> None:
     if nav:
         kb.row(*nav)
     kb.add(InlineKeyboardButton("⬅️ К рынку", callback_data="menu:market"))
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_orders(target, page: int = 0) -> None:
@@ -1566,7 +1772,7 @@ def show_orders(target, page: int = 0) -> None:
     if nav:
         kb.row(*nav)
     kb.add(InlineKeyboardButton("⬅️ К рынку", callback_data="menu:market"))
-    edit_or_send(target, "\n".join(lines), kb)
+    edit_or_send(target, "\n".join(lines), kb if is_private_target(target) else None)
 
 
 def show_bank(target, uid: int) -> None:
@@ -1580,7 +1786,7 @@ def show_bank(target, uid: int) -> None:
         f"Если взять сейчас, к возврату будет: {offer['debt']}.\n"
         + (f"Текущий долг: {debt}. Осталось: {format_seconds(remain)}" if debt else "Текущий долг: нет")
     )
-    edit_or_send(target, text, bank_menu())
+    edit_or_send(target, text, bank_menu() if is_private_target(target) else None)
 
 
 def ensure_task_sets(uid: int) -> tuple[str, str]:
@@ -1652,7 +1858,7 @@ def show_pet(target, uid: int) -> None:
 def show_camp(target, uid: int) -> None:
     p = get_player(uid)
     remain = max(0, int(p.get("camp_until", 0)) - now_ts())
-    text = "⛺ <b>Лагерь AFK</b>\n"
+    text = "⛺ <b>Лагерь офлайн</b>\n"
     if remain > 0:
         text += f"Лагерь работает ещё {format_seconds(remain)}."
     else:
@@ -1744,7 +1950,7 @@ def show_faction(target, uid: int) -> None:
     lines.append("")
     for key, data in FACTIONS.items():
         lines.append(f"{data['emoji']} <b>{data['title']}</b>\n{data['description']}\nБонусы: {format_bonus_dict(data['bonus'])}")
-    edit_or_send(target, "\n\n".join(lines), faction_menu(uid))
+    edit_or_send(target, "\n\n".join(lines), faction_menu(uid) if is_private_target(target) else None)
 
 
 def show_contracts(target, uid: int) -> None:
@@ -1758,6 +1964,23 @@ def show_contracts(target, uid: int) -> None:
     edit_or_send(target, "\n\n".join(lines), contracts_menu())
 
 
+def show_pvp_hub(target, uid: int) -> None:
+    p = get_player(uid) or {}
+    text = (
+        f"⚔️ <b>Арена и дуэли</b>\n"
+        f"Твой рейтинг: <b>{int(p.get('rating', 1000))}</b> · лига: <b>{league_name(int(p.get('rating', 1000)))}</b>\n"
+        f"Победы: {int(p.get('wins', 0))} · Поражения: {int(p.get('losses', 0))}\n\n"
+        f"<b>Как сражаться в группе:</b>\n"
+        f"• напиши <code>пвп @username</code> или ответь на сообщение словом <code>дуэль</code>\n"
+        f"• вызванный игрок отвечает на карточку словом «принять» или «отклонить»\n"
+        f"• зрители могут ставить на победителя валютой или материалами\n"
+        f"• победитель получает трофей из инвентаря проигравшего и долю от ставок\n\n"
+        f"<b>Ставка зрителя:</b> ответь на карточку дуэли текстом <code>ставка 50 монет @username</code>.\n"
+        f"Можно ставить и материалами: <code>ставка 5 железная руда</code>."
+    )
+    edit_or_send(target, text, pvp_menu() if is_private_target(target) else None)
+
+
 def show_ref(target, uid: int) -> None:
     bot_info = bot.get_me()
     link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
@@ -1766,8 +1989,32 @@ def show_ref(target, uid: int) -> None:
     edit_or_send(target, text, referral_menu(uid))
 
 
+def donate_menu_markup() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    for row in list_packs():
+        if not int(row.get('enabled', 1)) or not int(row.get('stars_enabled', 0)) or int(row.get('price_stars', 0)) <= 0:
+            continue
+        kb.add(InlineKeyboardButton(f"⭐ {row['name']} — {row['price_stars']} звёзд", callback_data=f"donate:buy:{row['code']}"))
+    kb.add(InlineKeyboardButton('⬅️ В меню', callback_data='menu:main'))
+    return kb
+
+
+def show_donate(target, uid: int) -> None:
+    if not donation_enabled():
+        edit_or_send(target, '💫 Донат сейчас отключён владельцем.', back_to_main(uid) if is_private_target(target) else None)
+        return
+    rows = [r for r in list_packs() if int(r.get('enabled', 1)) and int(r.get('stars_enabled', 0)) and int(r.get('price_stars', 0)) > 0]
+    lines = ['💫 <b>Поддержка проекта</b>', 'Покупки внутри Telegram идут в звёздах. Выбери пак ниже.', '']
+    if not rows:
+        lines.append('Сейчас нет доступных предложений.')
+    for row in rows:
+        reward = row.get('reward_json') or ''
+        lines.append(f"• {row['name']} — {row['price_stars']} ⭐")
+    edit_or_send(target, '\n'.join(lines), donate_menu_markup() if is_private_target(target) else None)
+
+
 def show_info(target) -> None:
-    edit_or_send(target, INFO_TEXT, info_menu())
+    edit_or_send(target, INFO_TEXT, info_menu() if is_private_target(target) else None)
 
 
 def show_admin(target) -> None:
@@ -1860,6 +2107,86 @@ def try_spawn_chat_event(message: Message) -> None:
     bot.send_message(message.chat.id, f"✨ <b>{event['title']}</b>\n{event['text']}", reply_markup=kb)
 
 
+def finish_pvp_request(target, req_id: int) -> None:
+    req = get_pvp_request(req_id)
+    if not req or req['status'] != 'pending':
+        edit_or_send(target, 'Запрос на дуэль устарел.', None)
+        return
+    a_uid = int(req['from_user'])
+    d_uid = int(req['to_user'])
+    a = get_player(a_uid)
+    d = get_player(d_uid)
+    a_extras = get_player_extras(a_uid)
+    d_extras = get_player_extras(d_uid)
+    a_stats = effective_profile(a, get_equipment(a_uid), get_buffs(a_uid), a_extras)
+    d_stats = effective_profile(d, get_equipment(d_uid), get_buffs(d_uid), d_extras)
+    res = resolve_pvp(a, d, a_stats, d_stats, int(req.get('stake_gold', 0)), bool(req.get('ranked', 1)))
+    from user_data import set_pvp_request_status, add_xp, advance_task
+    set_pvp_request_status(req_id, 'done')
+    win = int(res['winner_id'])
+    lose = int(res['loser_id'])
+    win_stats = a_stats if win == a_uid else d_stats
+    lose_stats = d_stats if lose == d_uid else a_stats
+    add_win(win)
+    add_loss(lose)
+    add_gold(win, 28)
+    add_gold(lose, 7)
+    add_xp(win, 55)
+    add_xp(lose, 18)
+    advance_task(win, 'pvp', 1)
+    advance_task(lose, 'pvp', 1)
+    apply_level_sync(win)
+    apply_level_sync(lose)
+    trophy = take_pvp_tribute(lose, win, int(win_stats.get('luck', 0)), int(lose_stats.get('luck', 0)))
+    bets_result = settle_pvp_bets(req_id, win)
+    trophy_lines = []
+    for row in trophy.get('items', [])[:6]:
+        trophy_lines.append('• ' + format_item_line(int(row['item_id']), int(row['amount'])))
+    if trophy.get('loan_used', 0):
+        trophy_lines.append(f"• 🏦 Банковский заём для расчёта: {format_item_line(CURRENCY_ID, int(trophy['loan_used']))}")
+    if trophy.get('debt_gold', 0):
+        trophy_lines.append(f"• 📜 Остаток записан долгом: {format_item_line(CURRENCY_ID, int(trophy['debt_gold']))}")
+    if not trophy_lines:
+        trophy_lines.append('• Излишков для трофея не нашлось.')
+    bet_lines = []
+    for row in bets_result.get('hero_share', [])[:4]:
+        bet_lines.append('• Победителю со ставок: ' + format_item_line(int(row['item_id']), int(row['amount'])))
+    if bets_result.get('bettors'):
+        bet_lines.append(f"• Победивших ставок выплачено: {len(bets_result['bettors'])}")
+    result_text = (
+        f"⚔️ <b>Дуэль завершена</b>\n"
+        f"Победитель: {get_display_name(win)}\n"
+        f"Проигравший: {get_display_name(lose)}\n\n"
+        f"<b>Трофеи победителя</b>\n" + '\n'.join(trophy_lines) + '\n\n'
+        f"<b>Ставки зрителей</b>\n" + ('\n'.join(bet_lines) if bet_lines else '• Выплат по ставкам не было.') + '\n\n'
+        f"<b>Краткий лог боя</b>\n" + '\n'.join(res['log'][:10])
+    )
+    if hasattr(target, 'chat'):
+        req_chat = getattr(target.chat, 'id', 0)
+    else:
+        req_chat = getattr(getattr(target, 'message', None), 'chat', type('x', (), {'id':0})()).id
+    try:
+        if int(req.get('chat_id', 0)) and int(req.get('message_id', 0)):
+            bot.edit_message_text(result_text, int(req['chat_id']), int(req['message_id']), reply_markup=None)
+        else:
+            edit_or_send(target, result_text, None)
+    except Exception:
+        edit_or_send(target, result_text, None)
+
+
+def decline_pvp_request(target, req_id: int) -> None:
+    from user_data import set_pvp_request_status
+    set_pvp_request_status(req_id, 'declined')
+    try:
+        req = get_pvp_request(req_id) or {}
+        if int(req.get('chat_id', 0)) and int(req.get('message_id', 0)):
+            bot.edit_message_text('❌ Вызов на арену отклонён.', int(req['chat_id']), int(req['message_id']), reply_markup=None)
+            return
+    except Exception:
+        pass
+    edit_or_send(target, '❌ Вызов на арену отклонён.', None)
+
+
 def parse_interaction_trigger(message: Message) -> bool:
     text = (message.text or '').strip()
     lowered = text.lower()
@@ -1870,7 +2197,18 @@ def parse_interaction_trigger(message: Message) -> bool:
     deal_words = ['сделк', 'обмен']
     request_words = ['попрос', 'запрос', 'прошу', 'нужн']
     pvp_words = ['пвп', 'дуэл', 'поедин', 'вызов', 'бой']
+    stake_words = ['ставк', 'постав', 'болею', 'голос']
     friend_words = ['друг', 'друж']
+    accept_words = ['принят', 'соглас', 'ок', 'го']
+    decline_words = ['отклон', 'отказ', 'не буду', 'пас']
+
+    req_pending = resolve_pending_pvp_request(message) if message.chat.type != 'private' else None
+    if req_pending and int(req_pending.get('to_user', 0)) == uid and any(word in lowered for word in accept_words):
+        finish_pvp_request(message, int(req_pending['id']))
+        return True
+    if req_pending and uid in {int(req_pending.get('to_user', 0)), int(req_pending.get('from_user', 0))} and any(word in lowered for word in decline_words):
+        decline_pvp_request(message, int(req_pending['id']))
+        return True
 
     if any(word in lowered for word in gift_words):
         if not target or int(target['user_id']) == uid:
@@ -1924,14 +2262,48 @@ def parse_interaction_trigger(message: Message) -> bool:
         send_temp(message.chat.id, f'🙏 Запрос #{req_id} создан: {format_item_line(int(item["id"]), int(amount))}. Другие игроки могут закрыть его частями.')
         return True
 
+    if any(word in lowered for word in stake_words):
+        req = resolve_pvp_request_for_bet(message)
+        if not req:
+            send_temp(message.chat.id, 'Активная дуэль для ставки не найдена. Ответь на карточку дуэли сообщением со ставкой.', ttl=12)
+            return True
+        if uid in {int(req['from_user']), int(req['to_user'])}:
+            send_temp(message.chat.id, 'Участники дуэли не могут ставить на собственный бой.', ttl=12)
+            return True
+        mentioned = resolve_target_from_message(message, text)
+        pick_user = int(mentioned['user_id']) if mentioned and int(mentioned['user_id']) in {int(req['from_user']), int(req['to_user'])} else 0
+        if not pick_user:
+            low = normalize_lookup(text)
+            if 'инициатор' in low or 'перв' in low or 'лев' in low:
+                pick_user = int(req['from_user'])
+            elif 'защит' in low or 'втор' in low or 'прав' in low:
+                pick_user = int(req['to_user'])
+        if not pick_user:
+            send_temp(message.chat.id, 'Укажи, на кого ставишь: ответь на карточку и напиши, например, «ставка 50 монет @username».', ttl=16)
+            return True
+        item, amount, err = parse_amount_and_item_query(text, verbs=['ставка', 'ставлю', 'поставить', 'болею', 'голосую'], categories=['currency', 'material'])
+        if err:
+            send_temp(message.chat.id, err, ttl=16)
+            return True
+        ok, resp = create_pvp_bet(uid, int(req['id']), pick_user, int(item['id']), int(amount))
+        if ok:
+            send_temp(message.chat.id, f'📈 Ставка принята: {format_item_line(int(item["id"]), int(amount))} на {get_display_name(pick_user)}', ttl=14)
+            try:
+                text2, kb2 = render_pvp_card(int(req['id']), for_private=message.chat.type == 'private')
+                bot.edit_message_text(text2, int(req['chat_id']), int(req['message_id']), reply_markup=kb2)
+            except Exception:
+                pass
+        else:
+            send_temp(message.chat.id, resp, ttl=14)
+        return True
+
     if any(word in lowered for word in pvp_words):
         if target and int(target['user_id']) != uid:
-            req_id = create_pvp_request(uid, int(target['user_id']), 0, True, now_ts() + 600)
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(InlineKeyboardButton('✅ Принять', callback_data=f'pvp:accept:{req_id}'), InlineKeyboardButton('❌ Отклонить', callback_data=f'pvp:decline:{req_id}'))
-            msg = bot.send_message(message.chat.id, f"⚔️ {get_display_name(uid)} вызывает {get_display_name(int(target['user_id']))} на дуэль!", reply_markup=kb)
-            if message.chat.type != 'private':
-                safe_delete(message.chat.id, msg.message_id, 300)
+            req_id = create_pvp_request(uid, int(target['user_id']), 0, True, now_ts() + 900, message.chat.id, 0)
+            dummy_req = {'id': req_id, 'from_user': uid, 'to_user': int(target['user_id']), 'status': 'pending'}
+            text_card, kb = render_pvp_card(req_id, for_private=message.chat.type == 'private')
+            msg = bot.send_message(message.chat.id, text_card, reply_markup=kb)
+            update_pvp_request_message(req_id, message.chat.id, msg.message_id)
             return True
 
     if any(word in lowered for word in friend_words):
@@ -1948,6 +2320,10 @@ def parse_interaction_trigger(message: Message) -> bool:
 @bot.message_handler(commands=['start'])
 def start_cmd(message: Message) -> None:
     maintenance()
+    if message.chat.type == 'private':
+        ensure_private_reply_keyboard(message, force=True)
+    else:
+        clear_stale_reply_keyboard(message, force=True)
     raw = message.text or '/start'
     referrer = 0
     m = re.search(r'ref_(\d+)', raw)
@@ -1967,7 +2343,18 @@ def start_cmd(message: Message) -> None:
     open_main(message)
 
 
+
+
+@bot.message_handler(commands=['rmkb', 'clearkb'])
+def clear_keyboard_cmd(message: Message) -> None:
+    clear_stale_reply_keyboard(message, force=True)
+    send_temp(message.chat.id, '🧹 Старые кнопки очищены. В личных сообщениях включена новая клавиатура навигации.', ttl=8)
+
 def short_menu_command(message: Message, action: str) -> None:
+    if message.chat.type == 'private':
+        ensure_private_reply_keyboard(message)
+    else:
+        clear_stale_reply_keyboard(message)
     sync_user(message)
     maintenance()
     safe_delete(message.chat.id, message.message_id, 2)
@@ -1979,6 +2366,8 @@ def short_menu_command(message: Message, action: str) -> None:
         show_profile(message, message.from_user.id)
     elif action == 'inv':
         show_inventory(message, message.from_user.id, 'all', 0)
+    elif action == 'pvp':
+        show_pvp_hub(message, message.from_user.id)
     elif action == 'exp':
         show_expedition_menu(message)
     elif action == 'dng':
@@ -2020,7 +2409,7 @@ def short_menu_command(message: Message, action: str) -> None:
 
 
 for cmd, action in [
-    ('m', 'main'), ('menu', 'main'), ('p', 'profile'), ('profile', 'profile'), ('inv', 'inv'), ('x', 'exp'), ('d', 'dng'),
+    ('m', 'main'), ('menu', 'main'), ('p', 'profile'), ('profile', 'profile'), ('inv', 'inv'), ('pvp', 'pvp'), ('x', 'exp'), ('d', 'dng'),
     ('s', 'shop'), ('bm', 'black'), ('mk', 'market'), ('c', 'craft'), ('b', 'bank'), ('task', 'tasks'), ('boss', 'boss'),
     ('pet', 'pet'), ('camp', 'camp'), ('clan', 'clan'), ('mail', 'mail'), ('top', 'top'), ('ref', 'ref'), ('info', 'info'), ('help', 'info'),
     ('tal', 'tal'), ('fac', 'fac'), ('ct', 'ct')
@@ -2065,6 +2454,28 @@ def handle_state(message: Message, state: dict[str, Any]) -> bool:
     code = state['state_code']
     payload = state['payload']
     try:
+        if code == 'pvp_bet':
+            req = get_pvp_request(int(payload['request_id']))
+            if not req:
+                clear_user_state(uid)
+                send_temp(message.chat.id, 'Дуэль уже недоступна.')
+                return True
+            item, amount, err = parse_amount_and_item_query(text, verbs=['ставка', 'ставлю', 'поставить', 'болею', 'голосую'], categories=['currency', 'material'])
+            if err:
+                send_temp(message.chat.id, err)
+                return True
+            ok, resp = create_pvp_bet(uid, int(payload['request_id']), int(payload['pick_user']), int(item['id']), int(amount))
+            if ok:
+                clear_user_state(uid)
+                send_temp(message.chat.id, f"📈 Ставка принята: {format_item_line(int(item['id']), int(amount))} на {get_display_name(int(payload['pick_user']))}.")
+                try:
+                    text2, kb2 = render_pvp_card(int(payload['request_id']), for_private=message.chat.type == 'private')
+                    bot.edit_message_text(text2, int(req['chat_id']), int(req['message_id']), reply_markup=kb2)
+                except Exception:
+                    pass
+            else:
+                send_temp(message.chat.id, resp)
+            return True
         if code == 'gift':
             target = resolve_target_from_message(message, text)
             if not target:
@@ -2380,6 +2791,34 @@ def handle_state(message: Message, state: dict[str, Any]) -> bool:
             clear_user_state(uid)
             send_temp(message.chat.id, f'Админ удалён: {get_display_name(int(target["user_id"]))}.')
             return True
+        if code == 'admin_bank_debt' and uid == OWNER_ID:
+            target = resolve_target_from_message(message, text)
+            parts = text.split()
+            amount_part = None
+            for token in reversed(parts):
+                if re.fullmatch(r'-?\d+', token):
+                    amount_part = token
+                    break
+            if not target or amount_part is None:
+                send_temp(message.chat.id, 'Формат: @username сумма. 0 — аннулировать, отрицательное число — уменьшить долг, положительное — установить долг.')
+                return True
+            amount_val = int(amount_part)
+            if amount_val < 0:
+                ok2, msg2 = reduce_bank_debt_admin(int(target['user_id']), abs(amount_val))
+            else:
+                ok2, msg2 = set_bank_debt_admin(int(target['user_id']), amount_val)
+            clear_user_state(uid)
+            send_temp(message.chat.id, msg2)
+            return True
+        if code == 'admin_pack_stars_price' and uid == OWNER_ID:
+            parts = text.split()
+            if len(parts) != 2:
+                send_temp(message.chat.id, 'Формат: код_пака цена_в_звёздах. Пример: starter_pack 35')
+                return True
+            ok2, msg2 = set_pack_stars_price(parts[0], int(parts[1]))
+            clear_user_state(uid)
+            send_temp(message.chat.id, msg2)
+            return True
         if code == 'admin_give_selected' and uid == OWNER_ID:
             target, amount = parse_target_and_amount(message, text, default_amount=1)
             item_id = int(payload['item_id'])
@@ -2411,10 +2850,13 @@ def handle_state(message: Message, state: dict[str, Any]) -> bool:
             return True
         if code == 'admin_promo' and uid == OWNER_ID:
             parts = text.split()
+            if len(parts) < 4:
+                send_temp(message.chat.id, 'Понятный формат: КОД количество_активаций золото премиум. Пример: VESNA2026 50 100 2')
+                return True
             code_promo, uses, gold, premium = parts[0], int(parts[1]), int(parts[2]), int(parts[3])
             create_promo(code_promo, {'gold': gold, 'premium': premium}, uses)
             clear_user_state(uid)
-            send_temp(message.chat.id, 'Промокод создан.')
+            send_temp(message.chat.id, f'Промокод создан: {code_promo} · активаций {uses} · золото {gold} · премиум {premium}.')
             return True
     except Exception:
         send_temp(message.chat.id, 'Неверный формат данных для этого действия.')
@@ -2486,6 +2928,9 @@ def callbacks(call) -> None:
         return
     if data == 'menu:profile':
         show_profile(call, uid)
+        return
+    if data == 'menu:pvp':
+        show_pvp_hub(call, uid)
         return
     if data == 'menu:gear':
         show_gear(call, uid)
@@ -2835,7 +3280,7 @@ def callbacks(call) -> None:
             ('main', '/m', 'главное меню'), ('profile', '/p', 'профиль'), ('inv', '/inv', 'инвентарь'), ('exp', '/x', 'экспедиция'),
             ('dng', '/d', 'подземелье'), ('shop', '/s', 'магазин'), ('black', '/bm', 'чёрный рынок'), ('market', '/mk', 'рынок и аукцион'),
             ('craft', '/c', 'крафт'), ('bank', '/b', 'банк'), ('tasks', '/task', 'задания'), ('boss', '/boss', 'мировой босс'),
-            ('pet', '/pet', 'питомец'), ('camp', '/camp', 'лагерь AFK'), ('clan', '/clan', 'стая / клан'), ('mail', '/mail', 'почта'),
+            ('pet', '/pet', 'питомец'), ('camp', '/camp', 'лагерь офлайн'), ('clan', '/clan', 'стая / клан'), ('mail', '/mail', 'почта'),
             ('top', '/top', 'рейтинги'), ('ref', '/ref', 'рефералка'), ('info', '/info', 'инфо и правила'), ('tal', '/tal', 'таланты'),
             ('fac', '/fac', 'фракция'), ('ct', '/ct', 'контракты'), ('adm', '/adm', 'секретная панель владельца'),
         ]
@@ -2847,7 +3292,7 @@ def callbacks(call) -> None:
         return
     if data == 'info:economy':
         eco = economy_snapshot()
-        txt = f"📈 <b>Экономика дня</b>\nСпрос: {eco['demand']}\nИзбыток: {eco['surplus']}\nМагазин автоматически подстраивает цены и ассортимент под тренд дня."
+        txt = f"📈 <b>Экономика дня</b>\nСпрос: {category_title_ru(eco['demand'])}\nИзбыток: {category_title_ru(eco['surplus'])}\nМагазин автоматически подстраивает цены и ассортимент под тренд дня."
         edit_or_send(call, txt, info_menu())
         return
     if data == 'menu:spec':
@@ -2954,6 +3399,51 @@ def callbacks(call) -> None:
         rows = list_suspicions(False, 20)
         text = '🚨 <b>Подозрения</b>\n\n' + '\n'.join([f"• #{r['id']} {get_display_name(int(r['user_id']))}: {r['reason']}" for r in rows] or ['Пусто.'])
         edit_or_send(call, text, simple_back('menu:admin'))
+        return
+    if data == 'admin:donate' and uid == OWNER_ID:
+        rows = list_packs()
+        state = 'включён' if donation_enabled() else 'выключен'
+        lines = [f'💫 <b>Донат и звёзды</b>', f'Глобальный статус: <b>{state}</b>', '', 'Каждый пак можно отдельно включать и выключать, а также задавать цену в звёздах.']
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton('🔁 Вкл/выкл весь донат', callback_data='admin:donate:toggle'))
+        kb.add(InlineKeyboardButton('💠 Цена в звёздах', callback_data='state:admin_pack_stars_price'))
+        for row in rows:
+            lines.append(f"• {row['code']} · {row['name']} · {row.get('price_stars', 0)} ⭐ · {'звёзды вкл.' if row.get('stars_enabled') else 'звёзды выкл.'}")
+            kb.add(InlineKeyboardButton(f"Переключить ⭐ {row['code']}", callback_data=f"admin:starspack:{row['code']}"))
+        kb.add(InlineKeyboardButton('⬅️ Админ', callback_data='menu:admin'))
+        edit_or_send(call, '\n'.join(lines), kb)
+        return
+    if data == 'admin:donate:toggle' and uid == OWNER_ID:
+        toggle_donation_enabled()
+        # reopen donation menu
+        rows = list_packs()
+        state = 'включён' if donation_enabled() else 'выключен'
+        lines = [f'💫 <b>Донат и звёзды</b>', f'Глобальный статус: <b>{state}</b>', '', 'Каждый пак можно отдельно включать и выключать, а также задавать цену в звёздах.']
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton('🔁 Вкл/выкл весь донат', callback_data='admin:donate:toggle'))
+        kb.add(InlineKeyboardButton('💠 Цена в звёздах', callback_data='state:admin_pack_stars_price'))
+        for row in rows:
+            lines.append(f"• {row['code']} · {row['name']} · {row.get('price_stars', 0)} ⭐ · {'звёзды вкл.' if row.get('stars_enabled') else 'звёзды выкл.'}")
+            kb.add(InlineKeyboardButton(f"Переключить ⭐ {row['code']}", callback_data=f"admin:starspack:{row['code']}"))
+        kb.add(InlineKeyboardButton('⬅️ Админ', callback_data='menu:admin'))
+        edit_or_send(call, '\n'.join(lines), kb)
+        return
+    if data.startswith('admin:starspack:') and uid == OWNER_ID:
+        _, _, code_pack = data.split(':')
+        ok2, msg2 = toggle_pack_stars(code_pack)
+        answer_cb(call, msg2[:80])
+        # reopen screen
+        rows = list_packs()
+        state = 'включён' if donation_enabled() else 'выключен'
+        lines = [f'💫 <b>Донат и звёзды</b>', f'Глобальный статус: <b>{state}</b>', '', 'Каждый пак можно отдельно включать и выключать, а также задавать цену в звёздах.']
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton('🔁 Вкл/выкл весь донат', callback_data='admin:donate:toggle'))
+        kb.add(InlineKeyboardButton('💠 Цена в звёздах', callback_data='state:admin_pack_stars_price'))
+        for row in rows:
+            lines.append(f"• {row['code']} · {row['name']} · {row.get('price_stars', 0)} ⭐ · {'звёзды вкл.' if row.get('stars_enabled') else 'звёзды выкл.'}")
+            kb.add(InlineKeyboardButton(f"Переключить ⭐ {row['code']}", callback_data=f"admin:starspack:{row['code']}"))
+        kb.add(InlineKeyboardButton('⬅️ Админ', callback_data='menu:admin'))
+        edit_or_send(call, '\n'.join(lines), kb)
         return
     if data == 'admin:give_menu' and uid == OWNER_ID:
         edit_or_send(call, '🎒 <b>Выдача предмета</b>\nМожно написать название предмета вручную или выбрать его из списка.', admin_choose_menu('give'))
@@ -3062,6 +3552,34 @@ def callbacks(call) -> None:
         set_user_state(uid, 'admin_pack_selected', {'pack_code': pack_code})
         edit_or_send(call, f'🎁 Выбран пак <b>{pack_code}</b>\nТеперь укажи игрока ответом на сообщение, через @username или ID.', simple_back('menu:admin'))
         return
+    if data.startswith('donate:buy:'):
+        if not is_private_target(call.message):
+            answer_cb(call, 'Покупка доступна только в личных сообщениях')
+            return
+        if not donation_enabled():
+            answer_cb(call, 'Донат выключен владельцем')
+            return
+        code_pack = data.split(':')[2]
+        row = next((r for r in list_packs() if r['code'] == code_pack), None)
+        if not row or not int(row.get('enabled', 1)) or not int(row.get('stars_enabled', 0)) or int(row.get('price_stars', 0)) <= 0:
+            answer_cb(call, 'Пак недоступен')
+            return
+        try:
+            bot.send_invoice(
+                call.message.chat.id,
+                title=row['name'],
+                description=f"Игровой пак «{row['name']}» для бота {GAME_TITLE}.",
+                invoice_payload=f"pack:{code_pack}",
+                provider_token='',
+                currency='XTR',
+                prices=[LabeledPrice(label=row['name'], amount=int(row['price_stars']))],
+                start_parameter=f"pack_{code_pack}",
+            )
+            answer_cb(call, 'Счёт отправлен')
+        except Exception:
+            answer_cb(call, 'Не удалось отправить счёт')
+        return
+
     if data.startswith('owned:list:'):
         _, _, action, page = data.split(':')
         show_owned_item_picker(call, uid, action, int(page))
@@ -3081,6 +3599,9 @@ def callbacks(call) -> None:
             set_user_state(uid, 'gift_selected', {'item_id': int(item_id)})
             edit_or_send(call, f'🎁 Выбран предмет: {item["emoji"]} <b>{item["name"]}</b>\nТеперь укажи игрока ответом на сообщение, через @username или ID, а затем количество.\nПримеры:\n@Treninem 2\n2097006037 1', simple_back('menu:market'))
             return
+    if data == 'pvp:guide':
+        edit_or_send(call, '⚔️ В группе вызови соперника сообщением <code>пвп @username</code>, <code>дуэль @username</code> или ответом на сообщение. Зрители ставят текстом ответом на карточку дуэли.', pvp_menu())
+        return
     if data.startswith('state:'):
         code = data.split(':')[1]
         prompts = {
@@ -3090,6 +3611,7 @@ def callbacks(call) -> None:
             'sell': 'Формат: название_предмета количество цена_за_штуку',
             'auction': 'Формат: название_предмета количество стартовая_ставка часы',
             'order': 'Формат: название_предмета количество цена_за_штуку часы',
+            'pvp_bet': 'Формат: 50 монет или 5 железная руда',
             'clan_create': 'Введи название стаи',
             'clan_join': 'Введи ID стаи',
             'clan_donate': 'Введи сумму доната в казну',
@@ -3104,13 +3626,27 @@ def callbacks(call) -> None:
             'admin_unblock': 'Формат: @user или ответ на сообщение',
             'admin_add': 'Формат: @user или ответ на сообщение',
             'admin_del': 'Формат: @user или ответ на сообщение',
-            'admin_promo': 'Формат: CODE uses gold premium',
+            'admin_bank_debt': 'Формат: @username сумма. 0 — аннулировать, -500 — уменьшить на 500, 1200 — установить долг 1200.',
+            'admin_pack_stars_price': 'Формат: код_пака цена_в_звёздах. Пример: starter_pack 35',
+            'admin_promo': 'Формат по-русски: КОД количество_активаций золото премиум. Пример: VESNA2026 50 100 2',
         }
         if code.startswith('admin') and uid != OWNER_ID:
             answer_cb(call, 'Недоступно')
             return
         ask_state(call.message.chat.id, uid, code, prompts.get(code, 'Введи данные'))
         answer_cb(call, 'Жду следующее сообщение')
+        return
+    if data.startswith('pvp:bet:'):
+        _, _, req_id, pick_user = data.split(':')
+        req = get_pvp_request(int(req_id))
+        if not req or req.get('status') != 'pending':
+            answer_cb(call, 'Дуэль уже закрыта')
+            return
+        if uid in {int(req['from_user']), int(req['to_user'])}:
+            answer_cb(call, 'Участники дуэли не могут ставить')
+            return
+        ask_state(call.message.chat.id, uid, 'pvp_bet', f'Ставка на {get_display_name(int(pick_user))}. Напиши сумму и предмет: например «50 монет» или «5 железная руда».', {'request_id': int(req_id), 'pick_user': int(pick_user)})
+        answer_cb(call, 'Жду сообщение со ставкой')
         return
     if data.startswith('pvp:accept:'):
         req_id = int(data.split(':')[2])
@@ -3121,30 +3657,18 @@ def callbacks(call) -> None:
         if int(req['to_user']) != uid:
             answer_cb(call, 'Это не твой запрос')
             return
-        a = get_player(int(req['from_user']))
-        d = get_player(int(req['to_user']))
-        res = resolve_pvp(a, d, effective_profile(a, get_equipment(int(req['from_user'])), get_buffs(int(req['from_user'])), get_player_extras(int(req['from_user']))), effective_profile(d, get_equipment(uid), get_buffs(uid), get_player_extras(uid)), int(req['stake_gold']), bool(req['ranked']))
-        from user_data import set_pvp_request_status, add_xp, advance_task
-        set_pvp_request_status(req_id, 'done')
-        win = int(res['winner_id'])
-        lose = int(res['loser_id'])
-        add_win(win)
-        add_loss(lose)
-        add_gold(win, 28)
-        add_gold(lose, 7)
-        add_xp(win, 55)
-        add_xp(lose, 18)
-        advance_task(win, 'pvp', 1)
-        advance_task(lose, 'pvp', 1)
-        apply_level_sync(win)
-        apply_level_sync(lose)
-        text = f"⚔️ <b>Дуэль завершена</b>\nПобедитель: {get_display_name(win)}\n\n" + '\n'.join(res['log'][:12])
-        edit_or_send(call, text, back_to_main(uid))
+        finish_pvp_request(call, req_id)
         return
     if data.startswith('pvp:decline:'):
-        from user_data import set_pvp_request_status
-        set_pvp_request_status(int(data.split(':')[2]), 'declined')
-        edit_or_send(call, '❌ Вызов на PvP отклонён.', back_to_main(uid))
+        req_id = int(data.split(':')[2])
+        req = get_pvp_request(req_id)
+        if not req or req['status'] != 'pending':
+            answer_cb(call, 'Запрос устарел')
+            return
+        if uid not in {int(req['to_user']), int(req['from_user'])}:
+            answer_cb(call, 'Это не твой запрос')
+            return
+        decline_pvp_request(call, req_id)
         return
     if data.startswith('deal:ok:'):
         ok, msg = complete_deal(int(data.split(':')[2]))
@@ -3200,7 +3724,7 @@ def all_text(message: Message) -> None:
             break
     if not action:
         partial_map = [
-            ('проф', 'profile'), ('инв', 'inv'), ('магаз', 'shop'), ('рынок', 'market'), ('аукцион', 'market'), ('крафт', 'craft'), ('ремесло', 'craft'),
+            ('проф', 'profile'), ('инв', 'inv'), ('пвп', 'pvp'), ('дуэл', 'pvp'), ('арен', 'pvp'), ('бой', 'pvp'), ('магаз', 'shop'), ('рынок', 'market'), ('аукцион', 'market'), ('крафт', 'craft'), ('ремесло', 'craft'),
             ('банк', 'bank'), ('топ', 'top'), ('правил', 'info'), ('справ', 'info'), ('задан', 'tasks'), ('квест', 'tasks'), ('босс', 'boss'),
             ('стая', 'clan'), ('клан', 'clan'), ('питом', 'pet'), ('компаньон', 'pet'), ('лагерь', 'camp'), ('почта', 'mail'), ('реф', 'ref'),
             ('фракц', 'fac'), ('контракт', 'ct'), ('талант', 'tal'), ('умени', 'tal'), ('админ', 'adm')
@@ -3214,7 +3738,7 @@ def all_text(message: Message) -> None:
             admin_login(message)
         else:
             action_map = {
-                'main': 'main', 'profile': 'profile', 'inv': 'inv', 'exp': 'exp', 'dng': 'dng', 'shop': 'shop',
+                'main': 'main', 'profile': 'profile', 'inv': 'inv', 'pvp': 'pvp', 'exp': 'exp', 'dng': 'dng', 'shop': 'shop',
                 'black': 'black', 'market': 'market', 'craft': 'craft', 'bank': 'bank', 'tasks': 'tasks', 'boss': 'boss',
                 'pet': 'pet', 'camp': 'camp', 'clan': 'clan', 'mail': 'mail', 'top': 'top', 'ref': 'ref', 'info': 'info',
                 'tal': 'tal', 'fac': 'fac', 'ct': 'ct'
