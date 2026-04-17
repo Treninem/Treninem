@@ -34,9 +34,9 @@ from telegram.ext import (
     filters,
 )
 
-from app.config import get_commission_plan, load_settings
-from app.db import BotInstance, Database
-from app.keyboards import (
+from config import get_commission_plan, load_settings
+from db import BotInstance, Database
+from keyboards import (
     BOTS_PER_PAGE,
     FLAGS_PER_PAGE,
     USERS_PER_PAGE,
@@ -54,10 +54,10 @@ from app.keyboards import (
     suspicious_flag_actions_keyboard,
     text_types_keyboard,
 )
-from app.previews import preview_page_caption, preview_page_count, preview_page_path
-from app.presets import PRESET_BY_KEY
-from app.prompts import custom_edit_prompt, preset_edit_prompt
-from app.services.openai_service import OpenAIService
+from previews import preview_page_caption, preview_page_count, preview_page_path
+from presets import PRESET_BY_KEY
+from prompts import custom_edit_prompt, preset_edit_prompt
+from openai_service import OpenAIService
 
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',

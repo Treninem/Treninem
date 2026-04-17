@@ -60,8 +60,8 @@
 
 - `bot.py` — единый runtime для root-бота и всех дочерних ботов.
 - `app/db.py` — SQLite-модель платформы.
-- `app/services/openai_service.py` — OpenAI image/text/vision.
-- `assets/mask_previews/` — preview-страницы масок.
+- `openai_service.py` — OpenAI image/text/vision.
+- `page_1.jpg` ... `page_5.jpg` — preview-страницы масок в корне проекта.
 
 ## Установка
 

@@ -4,7 +4,7 @@ import os
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123:TEST')
 os.environ.setdefault('OPENAI_API_KEY', 'sk-test')
 
-from app.config import load_settings
+from config import load_settings
 from app.db import Database
 
 
