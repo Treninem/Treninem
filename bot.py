@@ -11,6 +11,8 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageOps
+
 from telegram import (
     Bot,
     BotCommand,
@@ -45,6 +47,7 @@ from keyboards import (
     admin_user_actions_keyboard,
     create_bot_keyboard,
     main_menu_keyboard,
+    cancel_flow_keyboard,
     owner_help_keyboard,
     preset_keyboard,
     premium_keyboard,
@@ -639,7 +642,8 @@ async def suggest_masks_for_last_photo(message: Message, user_id: int, context: 
         logger.exception('Mask suggestion failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
         db.save_job(bot_id, user_id, 'suggest', str(photo_path), None, None, 'Подбор стиля', 'failed', str(exc))
-        await wait_message.edit_text('Не удалось подобрать маски. Списание автоматически отменено, попробуй ещё раз позже.')
+        await maybe_notify_admins_about_ai_error(context, user_id, 'suggest', exc)
+        await wait_message.edit_text(friendly_ai_error(exc, 'suggest'))
         return
 
     buttons = []
@@ -671,7 +675,8 @@ async def generate_creative_text(message: Message, user_id: int, context: Contex
         logger.exception('Text generation failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
         db.save_job(bot_id, user_id, 'text', None, None, None, brief, 'failed', str(exc))
-        await wait_message.edit_text('Не удалось сгенерировать текст. Списание автоматически отменено, попробуй ещё раз.')
+        await maybe_notify_admins_about_ai_error(context, user_id, 'text', exc)
+        await wait_message.edit_text(friendly_ai_error(exc, 'text'))
         return
 
     chunks = split_text(result)
@@ -722,6 +727,40 @@ async def render_custom_mask(message: Message, user_id: int, context: ContextTyp
     )
 
 
+def friendly_ai_error(exc: Exception, mode: str) -> str:
+    raw = str(exc).lower()
+    action = 'сгенерировать изображение' if mode == 'image' else ('сгенерировать текст' if mode == 'text' else 'обработать запрос')
+    if 'incorrect api key' in raw or 'invalid api key' in raw or 'authentication' in raw or '401' in raw:
+        return f'Не удалось {action}: проблема с ключом OpenAI API. Списание автоматически отменено. Проверь OPENAI_API_KEY.'
+    if 'insufficient_quota' in raw or 'billing' in raw or '429' in raw or 'rate limit' in raw or 'quota' in raw:
+        return f'Не удалось {action}: у OpenAI сейчас лимит, квота или платёжная проблема. Списание автоматически отменено.'
+    if 'timed out' in raw or 'timeout' in raw or 'connection' in raw or 'temporarily unavailable' in raw:
+        return f'Не удалось {action}: AI-сервис не ответил вовремя. Списание автоматически отменено, попробуй ещё раз позже.'
+    if 'model' in raw and ('not found' in raw or 'does not exist' in raw or 'unsupported' in raw or 'permission' in raw or 'access' in raw):
+        return f'Не удалось {action}: выбранная AI-модель недоступна для этого ключа. Списание автоматически отменено. Проверь настройки моделей в .env.'
+    return f'Не удалось {action}. Списание автоматически отменено, попробуй ещё раз.'
+
+
+async def maybe_notify_admins_about_ai_error(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str, exc: Exception) -> None:
+    if not settings.admin_user_ids:
+        return
+    bot_id = get_current_bot_id(context)
+    bot_row = db.get_bot(bot_id)
+    bot_name = bot_row.title if bot_row else f'bot #{bot_id}'
+    text = (
+        '⚠️ <b>AI ошибка</b>\n\n'
+        f'Бот: <b>{html.escape(bot_name)}</b>\n'
+        f'Режим: <b>{html.escape(mode)}</b>\n'
+        f'Пользователь: <code>{user_id}</code>\n'
+        f'Ошибка: <code>{html.escape(str(exc))[:2500]}</code>'
+    )
+    for admin_id in settings.admin_user_ids[:3]:
+        try:
+            await runtime.send_root_message(admin_id, text)
+        except Exception:
+            logger.exception('Failed to notify admin %s about AI error', admin_id)
+
+
 async def execute_image_render(
     message: Message,
     user_id: int,
@@ -747,7 +786,8 @@ async def execute_image_render(
         logger.exception('Image render failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
         db.save_job(bot_id, user_id, job_type, str(source_path), None, preset_key, original_user_prompt, 'failed', str(exc))
-        await wait_message.edit_text('Не удалось сгенерировать изображение. Списание автоматически отменено, попробуй ещё раз.')
+        await maybe_notify_admins_about_ai_error(context, user_id, 'image', exc)
+        await wait_message.edit_text(friendly_ai_error(exc, 'image'))
         return
 
     output_path = settings.result_dir / f'{bot_id}_{user_id}_{uuid.uuid4().hex}.png'
@@ -806,9 +846,28 @@ async def save_incoming_image(message: Message) -> Path:
     else:
         raise RuntimeError('Сообщение не содержит изображения.')
 
-    file_path = settings.temp_dir / f'{message.from_user.id}_{uuid.uuid4().hex}{suffix}'
-    await telegram_file.download_to_drive(custom_path=str(file_path))
-    return file_path
+    original_path = settings.temp_dir / f'{message.from_user.id}_{uuid.uuid4().hex}{suffix}'
+    normalized_path = settings.temp_dir / f'{message.from_user.id}_{uuid.uuid4().hex}.jpg'
+    await telegram_file.download_to_drive(custom_path=str(original_path))
+    try:
+        with Image.open(original_path) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            elif img.mode == 'L':
+                img = img.convert('RGB')
+            max_side = max(img.size)
+            if max_side > 2048:
+                scale = 2048 / max_side
+                new_size = (max(1, int(img.size[0] * scale)), max(1, int(img.size[1] * scale)))
+                img = img.resize(new_size)
+            img.save(normalized_path, format='JPEG', quality=95, optimize=True)
+        maybe_remove_file(original_path)
+        return normalized_path
+    except Exception:
+        logger.exception('Image normalization failed, using original file as fallback')
+        maybe_remove_file(normalized_path)
+        return original_path
 
 
 def maybe_remove_file(path: Path) -> None:
@@ -977,8 +1036,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await query.message.reply_text(
             'Отправь токен твоего бота от @BotFather одним сообщением.\n\n'
-            'Для отмены напиши: <b>отмена</b>.',
+            'Ниже есть отдельная кнопка отмены.',
             parse_mode=ParseMode.HTML,
+            reply_markup=cancel_flow_keyboard(),
         )
         return
 
@@ -1123,8 +1183,9 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE, data:
         await query.message.reply_text(
             f'Напиши одним сообщением, сколько общих бонус-запросов изменить пользователю <code>{user_id}</code>.\n'
             'Примеры: <code>25</code>, <code>7</code>, <code>-3</code>.\n'
-            'Для отмены напиши: <b>отмена</b>.',
+            'Для отмены нажми кнопку ниже.',
             parse_mode=ParseMode.HTML,
+            reply_markup=cancel_flow_keyboard(),
         )
         return
     if data.startswith('admin:flags:'):
@@ -1420,7 +1481,7 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
     if not flow:
         return False
     lower = text.lower().strip()
-    if lower in {'отмена', 'cancel', 'стоп'}:
+    if lower in {'отмена', 'cancel', 'стоп', '❌ отмена'}:
         context.user_data.pop('create_bot_flow', None)
         await message.reply_text('Подключение бота отменено.', reply_markup=reply_menu(context, message.from_user.id if message.from_user else None))
         return True
@@ -1428,7 +1489,7 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
     if flow.get('step') == 'awaiting_token':
         token = text.strip()
         if not TOKEN_REGEX.fullmatch(token):
-            await message.reply_text('Похоже, это не токен. Вставь токен целиком из сообщения BotFather. Для отмены напиши «отмена».')
+            await message.reply_text('Похоже, это не токен. Вставь токен целиком из сообщения BotFather или нажми кнопку «❌ Отмена».', reply_markup=cancel_flow_keyboard())
             return True
         try:
             telegram_bot_id, username, inferred_title = await runtime.validate_child_token(token)
@@ -1440,15 +1501,17 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
         await message.reply_text(
             f'Токен принят. Бот найден: <b>{html.escape(inferred_title)}</b> ({html.escape("@" + username if username else "без username")}).\n\n'
             'Теперь пришли красивое название для карточки в сети.\n'
-            'Можно просто отправить одно сообщение, например: <code>Magic Mask by Alex</code>.',
+            'Можно просто отправить одно сообщение, например: <code>Magic Mask by Alex</code>.\n\n'
+            'Если передумал, нажми кнопку «❌ Отмена».',
             parse_mode=ParseMode.HTML,
+            reply_markup=cancel_flow_keyboard(),
         )
         return True
 
     if flow.get('step') == 'awaiting_title':
         desired_title = text.strip()[:80]
         if len(desired_title) < 2:
-            await message.reply_text('Название слишком короткое. Пришли более осмысленное название или «отмена».')
+            await message.reply_text('Название слишком короткое. Пришли более осмысленное название или нажми «❌ Отмена».', reply_markup=cancel_flow_keyboard())
             return True
         try:
             instance = await runtime.register_child_bot(
@@ -1459,7 +1522,15 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception('Child bot registration failed: %s', exc)
-            await message.reply_text(f'Не удалось подключить бота: {exc}')
+            if 'уже подключён к платформе' in str(exc):
+                context.user_data.pop('create_bot_flow', None)
+                await message.reply_text(
+                    'Этот бот уже подключён к платформе. Мастер остановлен.\n'
+                    'Если нужно, начни заново с другим токеном.',
+                    reply_markup=reply_menu(context, message.from_user.id if message.from_user else None),
+                )
+                return True
+            await message.reply_text(f'Не удалось подключить бота: {exc}', reply_markup=cancel_flow_keyboard())
             return True
         context.user_data.pop('create_bot_flow', None)
         username = '@' + instance.username if instance.username else 'без username'
@@ -1494,12 +1565,12 @@ async def text_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if bot_instance.kind == 'root' and is_admin_user(update.effective_user.id) and context.user_data.get('admin_pending_grant'):
         pending = context.user_data['admin_pending_grant']
-        if text.lower() in {'отмена', 'cancel', 'стоп'}:
+        if text.lower() in {'отмена', 'cancel', 'стоп', '❌ отмена'}:
             context.user_data.pop('admin_pending_grant', None)
             await message.reply_text('Выдача бонусов отменена.', reply_markup=reply_menu(context, update.effective_user.id))
             return
         if not re.fullmatch(r'[+-]?\d+', text):
-            await message.reply_text('Пришли целое число. Например: <code>25</code> или <code>-5</code>. Для отмены напиши «отмена».', parse_mode=ParseMode.HTML)
+            await message.reply_text('Пришли целое число. Например: <code>25</code> или <code>-5</code>. Для отмены нажми «❌ Отмена».', parse_mode=ParseMode.HTML, reply_markup=cancel_flow_keyboard())
             return
         delta = int(text)
         target_user_id = int(pending['user_id'])

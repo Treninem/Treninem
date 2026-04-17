@@ -114,6 +114,16 @@ def result_keyboard(last_kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+
+
+def cancel_flow_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton('❌ Отмена')]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder='Можно отменить текущее действие',
+    )
+
 def create_bot_keyboard(parent_bot_id: int | None = None) -> InlineKeyboardMarkup:
     cb = 'createbot:start' if parent_bot_id is None else f'createbot:start:{parent_bot_id}'
     return InlineKeyboardMarkup([[InlineKeyboardButton('🚀 Подключить моего бота', callback_data=cb)]])
