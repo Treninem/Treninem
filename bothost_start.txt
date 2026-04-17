@@ -1,5 +1,0 @@
-Команда запуска:
-python -u bot.py
-
-Команда установки зависимостей:
-pip install -r requirements.txt
