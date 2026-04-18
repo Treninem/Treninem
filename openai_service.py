@@ -39,18 +39,25 @@ class OpenAIService:
         )
         return any(marker in raw for marker in markers)
 
-    def edit_image(self, source_path: Path, prompt: str) -> bytes:
+    def edit_image(self, source_paths: list[Path], prompt: str) -> bytes:
+        if not source_paths:
+            raise RuntimeError('Не переданы исходные фото для редактирования.')
         last_exc: Exception | None = None
         models = self._candidate_models(self.settings.openai_image_model, ['gpt-image-1.5', 'gpt-image-1'])
         for model in models:
             try:
-                with source_path.open('rb') as image_file:
+                image_files = [path.open('rb') for path in source_paths]
+                try:
+                    image_arg = image_files[0] if len(image_files) == 1 else image_files
                     result = self.client.images.edit(
                         model=model,
-                        image=image_file,
+                        image=image_arg,
                         prompt=prompt,
                         input_fidelity='high' if model != 'gpt-image-1-mini' else 'low',
                     )
+                finally:
+                    for image_file in image_files:
+                        image_file.close()
                 if not result.data or not result.data[0].b64_json:
                     raise RuntimeError('OpenAI не вернул картинку.')
                 return base64.b64decode(result.data[0].b64_json)

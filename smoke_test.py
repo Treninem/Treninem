@@ -5,7 +5,7 @@ os.environ.setdefault('TELEGRAM_BOT_TOKEN', '123:TEST')
 os.environ.setdefault('OPENAI_API_KEY', 'sk-test')
 
 from config import load_settings
-from app.db import Database
+from db import Database
 
 
 def main() -> None:
@@ -25,7 +25,7 @@ def main() -> None:
         db.upsert_user(uid, username, first_name)
 
     root_id = db.ensure_root_bot('123:TEST', 111, 'rootbot', 'Root Bot')
-    child_id = db.create_child_bot('456:TEST', 222, 'childbot', 'Child Bot', 2, root_id)
+    child_id = db.create_child_bot('456:TEST', 222, 'childbot', 'Child Bot', 2, root_id, None)
 
     db.ensure_bot_user_state(child_id, 2)
     db.ensure_bot_user_state(child_id, 4)

@@ -19,6 +19,7 @@ class BotInstance:
     title: str
     owner_user_id: int | None
     parent_bot_id: int | None
+    sponsor_user_id: int | None
     status: str
     user_free_trial: int
     owner_daily_free: int
@@ -104,6 +105,7 @@ class Database:
                     title TEXT NOT NULL,
                     owner_user_id INTEGER,
                     parent_bot_id INTEGER,
+                    sponsor_user_id INTEGER,
                     status TEXT NOT NULL DEFAULT 'active',
                     user_free_trial INTEGER NOT NULL DEFAULT 5,
                     owner_daily_free INTEGER NOT NULL DEFAULT 10,
@@ -111,7 +113,8 @@ class Database:
                     updated_at TEXT NOT NULL,
                     launched_at TEXT,
                     FOREIGN KEY(owner_user_id) REFERENCES users(user_id),
-                    FOREIGN KEY(parent_bot_id) REFERENCES bot_instances(id)
+                    FOREIGN KEY(parent_bot_id) REFERENCES bot_instances(id),
+                    FOREIGN KEY(sponsor_user_id) REFERENCES users(user_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS bot_users (
@@ -203,6 +206,9 @@ class Database:
                 );
                 '''
             )
+            columns = {row['name'] for row in conn.execute("PRAGMA table_info(bot_instances)").fetchall()}
+            if 'sponsor_user_id' not in columns:
+                conn.execute('ALTER TABLE bot_instances ADD COLUMN sponsor_user_id INTEGER')
 
     @staticmethod
     def _now() -> str:
@@ -260,7 +266,7 @@ class Database:
             rows = conn.execute(
                 '''
                 SELECT id, kind, token, telegram_bot_id, username, title, owner_user_id,
-                       parent_bot_id, status, user_free_trial, owner_daily_free, created_at
+                       parent_bot_id, sponsor_user_id, status, user_free_trial, owner_daily_free, created_at
                 FROM bot_instances
                 WHERE status = 'active'
                 ORDER BY CASE WHEN kind = 'root' THEN 0 ELSE 1 END, id ASC
@@ -273,7 +279,7 @@ class Database:
             row = conn.execute(
                 '''
                 SELECT id, kind, token, telegram_bot_id, username, title, owner_user_id,
-                       parent_bot_id, status, user_free_trial, owner_daily_free, created_at
+                       parent_bot_id, sponsor_user_id, status, user_free_trial, owner_daily_free, created_at
                 FROM bot_instances
                 WHERE id = ?
                 ''',
@@ -289,6 +295,7 @@ class Database:
         title: str,
         owner_user_id: int,
         parent_bot_id: int | None,
+        sponsor_user_id: int | None,
     ) -> int:
         now = self._now()
         with self._connect() as conn:
@@ -298,16 +305,16 @@ class Database:
             cur = conn.execute(
                 '''
                 INSERT INTO bot_instances (
-                    kind, token, telegram_bot_id, username, title, owner_user_id, parent_bot_id,
+                    kind, token, telegram_bot_id, username, title, owner_user_id, parent_bot_id, sponsor_user_id,
                     status, user_free_trial, owner_daily_free, created_at, updated_at, launched_at
-                ) VALUES ('child', ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                ) VALUES ('child', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
                 ''',
-                (token, telegram_bot_id, username, title, owner_user_id, parent_bot_id, self.free_trial_credits, self.child_owner_daily_free, now, now, now),
+                (token, telegram_bot_id, username, title, owner_user_id, parent_bot_id, sponsor_user_id, self.free_trial_credits, self.child_owner_daily_free, now, now, now),
             )
             bot_id = int(cur.lastrowid)
             conn.execute(
                 'INSERT INTO usage_events (bot_id, user_id, event_type, subject, details, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                (bot_id, owner_user_id, 'child_bot', 'created', f'parent={parent_bot_id}', 'done', now),
+                (bot_id, owner_user_id, 'child_bot', 'created', f'parent={parent_bot_id}; sponsor={sponsor_user_id}', 'done', now),
             )
             self._ensure_bot_user_state_conn(conn, bot_id, owner_user_id)
             return bot_id
@@ -623,7 +630,7 @@ class Database:
             while current_bot_id and depth < max_depth:
                 row = conn.execute(
                     '''
-                    SELECT bi.id, bi.owner_user_id, bi.parent_bot_id, bi.title, bi.username,
+                    SELECT bi.id, bi.owner_user_id, bi.parent_bot_id, bi.sponsor_user_id, bi.title, bi.username,
                            u.username AS owner_username, u.first_name AS owner_first_name
                     FROM bot_instances bi
                     LEFT JOIN users u ON u.user_id = bi.owner_user_id
@@ -637,6 +644,13 @@ class Database:
                 current_bot_id = int(row['parent_bot_id']) if row['parent_bot_id'] is not None else 0
                 depth += 1
         return chain
+
+    def get_bot_sponsor_user_id(self, bot_id: int) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute('SELECT sponsor_user_id FROM bot_instances WHERE id = ?', (bot_id,)).fetchone()
+        if not row or row['sponsor_user_id'] is None:
+            return None
+        return int(row['sponsor_user_id'])
 
     def save_job(
         self,
@@ -884,10 +898,11 @@ class Database:
             total_row = conn.execute("SELECT COUNT(*) AS cnt FROM bot_instances WHERE kind = 'child'").fetchone()
             rows = conn.execute(
                 '''
-                SELECT bi.id, bi.kind, bi.username, bi.title, bi.owner_user_id, bi.parent_bot_id, bi.status,
+                SELECT bi.id, bi.kind, bi.username, bi.title, bi.owner_user_id, bi.parent_bot_id, bi.sponsor_user_id, bi.status,
                        bi.user_free_trial, bi.owner_daily_free, bi.created_at,
                        u.username AS owner_username, u.first_name AS owner_first_name,
                        p.title AS parent_title,
+                       s.username AS sponsor_username, s.first_name AS sponsor_first_name,
                        COALESCE((SELECT COUNT(*) FROM bot_users bu WHERE bu.bot_id = bi.id), 0) AS members_count,
                        COALESCE((SELECT COUNT(*) FROM jobs j WHERE j.bot_id = bi.id), 0) AS jobs_count,
                        COALESCE((SELECT COUNT(*) FROM payments pay WHERE pay.seller_bot_id = bi.id), 0) AS sales_count,
@@ -895,6 +910,7 @@ class Database:
                 FROM bot_instances bi
                 LEFT JOIN users u ON u.user_id = bi.owner_user_id
                 LEFT JOIN bot_instances p ON p.id = bi.parent_bot_id
+                LEFT JOIN users s ON s.user_id = bi.sponsor_user_id
                 WHERE bi.kind = 'child'
                 ORDER BY bi.created_at DESC, bi.id DESC
                 LIMIT ? OFFSET ?
@@ -907,10 +923,11 @@ class Database:
         with self._connect() as conn:
             row = conn.execute(
                 '''
-                SELECT bi.id, bi.kind, bi.username, bi.title, bi.owner_user_id, bi.parent_bot_id, bi.status,
+                SELECT bi.id, bi.kind, bi.username, bi.title, bi.owner_user_id, bi.parent_bot_id, bi.sponsor_user_id, bi.status,
                        bi.user_free_trial, bi.owner_daily_free, bi.created_at, bi.launched_at,
                        u.username AS owner_username, u.first_name AS owner_first_name,
                        p.title AS parent_title, p.username AS parent_username,
+                       s.username AS sponsor_username, s.first_name AS sponsor_first_name,
                        COALESCE((SELECT COUNT(*) FROM bot_users bu WHERE bu.bot_id = bi.id), 0) AS members_count,
                        COALESCE((SELECT COUNT(*) FROM jobs j WHERE j.bot_id = bi.id), 0) AS jobs_count,
                        COALESCE((SELECT COUNT(*) FROM payments pay WHERE pay.seller_bot_id = bi.id), 0) AS sales_count,
@@ -918,6 +935,7 @@ class Database:
                 FROM bot_instances bi
                 LEFT JOIN users u ON u.user_id = bi.owner_user_id
                 LEFT JOIN bot_instances p ON p.id = bi.parent_bot_id
+                LEFT JOIN users s ON s.user_id = bi.sponsor_user_id
                 WHERE bi.id = ?
                 ''',
                 (bot_id,),
@@ -928,19 +946,21 @@ class Database:
         with self._connect() as conn:
             rows = conn.execute(
                 '''
-                WITH RECURSIVE tree(id, title, username, owner_user_id, parent_bot_id, depth, path) AS (
-                    SELECT id, title, username, owner_user_id, parent_bot_id, 0 AS depth, printf('%06d', id) AS path
+                WITH RECURSIVE tree(id, title, username, owner_user_id, parent_bot_id, sponsor_user_id, depth, path) AS (
+                    SELECT id, title, username, owner_user_id, parent_bot_id, sponsor_user_id, 0 AS depth, printf('%06d', id) AS path
                     FROM bot_instances
                     WHERE kind = 'root'
                     UNION ALL
-                    SELECT c.id, c.title, c.username, c.owner_user_id, c.parent_bot_id, t.depth + 1,
+                    SELECT c.id, c.title, c.username, c.owner_user_id, c.parent_bot_id, c.sponsor_user_id, t.depth + 1,
                            t.path || '/' || printf('%06d', c.id)
                     FROM bot_instances c
                     JOIN tree t ON c.parent_bot_id = t.id
                 )
-                SELECT tree.*, u.username AS owner_username, u.first_name AS owner_first_name
+                SELECT tree.*, u.username AS owner_username, u.first_name AS owner_first_name,
+                       s.username AS sponsor_username, s.first_name AS sponsor_first_name
                 FROM tree
                 LEFT JOIN users u ON u.user_id = tree.owner_user_id
+                LEFT JOIN users s ON s.user_id = tree.sponsor_user_id
                 ORDER BY path
                 '''
             ).fetchall()

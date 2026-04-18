@@ -77,13 +77,27 @@ def quick_after_photo_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def photo_batch_keyboard(*, can_send: bool, mode: str = "preset") -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if can_send:
+        if mode == 'custom':
+            rows.append([InlineKeyboardButton('✍️ Написать описание маски', callback_data='media:custom_prompt')])
+        else:
+            rows.append([InlineKeyboardButton('✅ Отправить в шаблон', callback_data='media:send')])
+    rows.append([
+        InlineKeyboardButton('🗑 Очистить фото', callback_data='media:clear'),
+        InlineKeyboardButton('❌ Отмена', callback_data='media:cancel'),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 def premium_keyboard(root_username: str, seller_bot_id: int) -> InlineKeyboardMarkup:
     base = f'https://t.me/{root_username}?start=pay_{seller_bot_id}_'
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton('⭐ Старт-пак', url=base + 'pack_small')],
             [InlineKeyboardButton('🚀 Большой пак', url=base + 'pack_big')],
-            [InlineKeyboardButton('👑 PRO на 30 дней', url=base + 'pro_30')],
+            [InlineKeyboardButton('👑 MAX-пак', url=base + 'pro_30')],
         ]
     )
 
@@ -93,7 +107,7 @@ def root_buy_keyboard(seller_bot_id: int) -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton('⭐ Старт-пак', callback_data=f'pay:pack_small:{seller_bot_id}')],
             [InlineKeyboardButton('🚀 Большой пак', callback_data=f'pay:pack_big:{seller_bot_id}')],
-            [InlineKeyboardButton('👑 PRO на 30 дней', callback_data=f'pay:pro_30:{seller_bot_id}')],
+            [InlineKeyboardButton('👑 MAX-пак', callback_data=f'pay:pro_30:{seller_bot_id}')],
         ]
     )
 

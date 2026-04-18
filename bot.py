@@ -6,6 +6,7 @@ import logging
 import mimetypes
 import re
 import signal
+import time
 import uuid
 from math import ceil
 from pathlib import Path
@@ -49,6 +50,7 @@ from keyboards import (
     main_menu_keyboard,
     cancel_flow_keyboard,
     owner_help_keyboard,
+    photo_batch_keyboard,
     preset_keyboard,
     premium_keyboard,
     quick_after_photo_keyboard,
@@ -87,10 +89,10 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         'credits': settings.big_pack_credits,
     },
     'pro_30': {
-        'title': 'PRO 30 дней',
-        'description': 'Безлимитные запросы на 30 дней, приоритетное использование и доступ ко всем режимам.',
+        'title': 'MAX-пак',
+        'description': f'{settings.pro_pack_credits} запросов для тех, кто использует бот часто. Без безлимита — так экономика остаётся стабильной.',
         'price': settings.pro_30_price,
-        'premium_days': settings.pro_30_days,
+        'credits': settings.pro_pack_credits,
     },
 }
 
@@ -98,6 +100,70 @@ SUSPICIOUS_KEYWORDS = (
     'carding', 'scam', 'spam', 'phishing', 'fraud', 'adult', 'nude', 'nsfw', 'drugs',
     'кардинг', 'скам', 'спам', 'фишинг', 'мошенн', 'наркот', 'обнажен', '18+',
 )
+
+MAX_SOURCE_PHOTOS = 4
+
+
+def get_input_photo_paths(context: ContextTypes.DEFAULT_TYPE) -> list[Path]:
+    raw_paths = context.user_data.get('input_photo_paths') or []
+    valid: list[Path] = []
+    normalized: list[str] = []
+    for item in raw_paths:
+        path = Path(str(item))
+        if path.exists():
+            valid.append(path)
+            normalized.append(str(path))
+    context.user_data['input_photo_paths'] = normalized
+    if normalized:
+        context.user_data['last_photo_path'] = normalized[-1]
+    elif context.user_data.get('last_photo_path'):
+        context.user_data.pop('last_photo_path', None)
+    return valid
+
+
+def set_input_photo_paths(context: ContextTypes.DEFAULT_TYPE, paths: list[Path]) -> None:
+    normalized = [str(path) for path in paths if path.exists()]
+    context.user_data['input_photo_paths'] = normalized
+    if normalized:
+        context.user_data['last_photo_path'] = normalized[-1]
+    else:
+        context.user_data.pop('last_photo_path', None)
+
+
+def clear_input_photos(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for path in get_input_photo_paths(context):
+        maybe_remove_file(path)
+    context.user_data['input_photo_paths'] = []
+    context.user_data.pop('last_photo_path', None)
+
+
+def reset_media_session(context: ContextTypes.DEFAULT_TYPE, *, clear_photos: bool) -> None:
+    if clear_photos:
+        clear_input_photos(context)
+    context.user_data.pop('media_mode', None)
+    context.user_data.pop('pending_preset_key', None)
+    context.user_data.pop('awaiting_custom_prompt', None)
+
+
+def media_session_summary(context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None, int]:
+    mode = context.user_data.get('media_mode')
+    preset_key = context.user_data.get('pending_preset_key')
+    count = len(get_input_photo_paths(context))
+    return (str(mode) if mode else None, str(preset_key) if preset_key else None, count)
+
+
+def custom_mask_photo_hint() -> str:
+    return (
+        'Можно загрузить от 1 до 4 фото. Когда все кадры готовы, нажми «✍️ Написать описание маски».\n'
+        'Если на фото несколько людей, бот постарается сохранить каждого человека узнаваемым.'
+    )
+
+
+def preset_photo_hint(preset_title: str) -> str:
+    return (
+        f'Сейчас выбран шаблон: «{preset_title}». Можно загрузить от 1 до 4 фото и затем нажать «✅ Отправить в шаблон».\n'
+        'Если нужен результат с двумя людьми, можно отправить одно общее фото с двумя лицами или два отдельных фото — бот использует все загруженные кадры вместе.'
+    )
 
 
 class PlatformRuntime:
@@ -177,18 +243,25 @@ class PlatformRuntime:
         self,
         token: str,
         owner_user_id: int,
-        parent_bot_id: int | None,
+        ref_source_bot_id: int | None,
         desired_title: str | None,
     ) -> BotInstance:
         telegram_bot_id, username, inferred_title = await self.validate_child_token(token)
         title = (desired_title or inferred_title).strip()[:80]
+        root_instance = await self.ensure_root()
+        sponsor_user_id: int | None = None
+        if ref_source_bot_id and ref_source_bot_id != root_instance.id:
+            source_bot = db.get_bot(ref_source_bot_id)
+            if source_bot and source_bot.kind == 'child' and source_bot.owner_user_id is not None:
+                sponsor_user_id = int(source_bot.owner_user_id)
         bot_id = db.create_child_bot(
             token=token,
             telegram_bot_id=telegram_bot_id,
             username=username,
             title=title,
             owner_user_id=owner_user_id,
-            parent_bot_id=parent_bot_id,
+            parent_bot_id=root_instance.id,
+            sponsor_user_id=sponsor_user_id,
         )
         instance = db.get_bot(bot_id)
         if not instance:
@@ -331,11 +404,12 @@ async def send_create_bot_intro(message: Message, parent_bot_id: int | None = No
         '1) Создаёшь бота у <b>@BotFather</b>.\n'
         '2) Отправляешь токен в этот мастер подключения.\n'
         '3) Платформа автоматически запускает копию движка на твоём токене.\n\n'
-        'В твоём боте:\n'
-        '• остаются все AI-функции платформы;\n'
-        f'• тебе доступно <b>{settings.child_owner_daily_free} бесплатных запросов в день</b> как владельцу;\n'
-        '• покупка премиума проходит безопасно через корневого бота платформы;\n'
-        '• внутренняя многоуровневая комиссия считается автоматически в базе.\n\n'
+        'Как устроена сеть:\n'
+        '• все новые боты подключаются напрямую к корневому боту платформы;\n'
+        f'• владелец дочернего бота получает только <b>{settings.child_owner_daily_free}</b> бесплатный запрос в день;\n'
+        '• если ты пришёл по ссылке от другого дочернего бота, его владелец получает небольшой реферальный бонус;\n'
+        '• все продажи и основная комиссия всё равно учитываются у корневой платформы;\n'
+        '• админ-панель сети есть только у корневого владельца.\n\n'
         'Нажми кнопку ниже, чтобы начать мастер подключения.'
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=create_bot_keyboard(parent_bot_id))
@@ -349,12 +423,13 @@ async def explain_how_it_works(message: Message, context: ContextTypes.DEFAULT_T
         '• Отправь фото и выбери одну из 30 масок или опиши свою.\n'
         '• Можно сгенерировать стих, песню, поздравление, подпись и другие тексты.\n'
         '• Просмотр примеров масок бесплатный.\n'
-        f'• Первые <b>{settings.free_trial_credits}</b> запросов на каждом боте бесплатные.\n'
-        '• После этого можно купить запросы или PRO.\n\n'
+        f'• Новый пользователь получает <b>{settings.free_trial_credits}</b> бесплатный запрос на этом боте.\n'
+        '• После этого можно купить пакет запросов через Telegram Stars.\n\n'
     )
     if is_root:
         text += (
             'Этот бот также умеет подключать дочерние боты на токенах владельцев.\n'
+            'Все новые боты подключаются напрямую к корневой платформе, а реферальный бонус от пригласившего дочернего бота считается отдельно.\n'
             'Для старта открой «Подключить своего бота».\n'
         )
     else:
@@ -396,22 +471,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             '• маска по твоему тексту;\n'
             '• подбор лучших пресетов под конкретное фото;\n'
             '• стихи, песни, поэмы, поздравления, тосты, подписи и статусы;\n'
-            '• безопасная оплата пакетов и PRO через Telegram Stars;\n'
+            '• безопасная оплата пакетов через Telegram Stars;\n'
             '• мастер подключения дочерних ботов.\n\n'
-            f'🎁 На старте у тебя есть <b>{settings.free_trial_credits} бесплатных запросов</b> на этом боте.\n'
+            f'🎁 Стартовый лимит на этом боте: <b>{settings.free_trial_credits}</b> запрос.\n'
             'Отправь фото или выбери действие в меню ниже.'
         )
     else:
         invite_hint = f'https://t.me/{current_root_username()}?start=ref_{bot_instance.id}' if current_root_username() else ''
-        extra = f'\n\n🚀 Для запуска такого же бота: {invite_hint}' if invite_hint else ''
+        extra = f'\n\n🚀 Для запуска своего бота через корневую платформу: {invite_hint}' if invite_hint else ''
         text = (
             f'✨ <b>{html.escape(bot_instance.title)}</b>\n\n'
             'Это дочерний AI-бот платформы. Здесь ты можешь:\n'
             '• накладывать стильные маски на фото;\n'
             '• придумывать свою маску по тексту;\n'
             '• создавать стихи, песни, поздравления и подписи;\n'
-            '• покупать запросы и PRO через защищённую платформу.\n\n'
-            f'🎁 На этом боте у тебя есть <b>{settings.free_trial_credits} бесплатных запросов</b>.{extra}'
+            '• покупать запросы через защищённую платформу;\n'
+            '• запускать свой бот через корневую платформу и получать небольшой реферальный бонус.\n\n'
+            f'🎁 Стартовый лимит на этом боте: <b>{settings.free_trial_credits}</b> запрос.{extra}'
         )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_menu(context, update.effective_user.id))
 
@@ -441,7 +517,6 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text('Не удалось загрузить профиль.', reply_markup=reply_menu(context, user_id))
         return
 
-    premium_until = balance.premium_until or 'не активен'
     status = 'заблокирован' if balance.is_banned_global else 'активен'
     available_now = '∞' if is_admin_user(user_id) or balance.total_renders_left == '∞' else balance.total_renders_left
     mode = access_mode_label(user_id, balance)
@@ -453,7 +528,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f'• Бесплатных запросов на этом боте: <b>{balance.free_trial_left}</b>\n'
         f'• Платных запросов на этом боте: <b>{balance.paid_credits}</b>\n'
         f'• Бонусов по сети: <b>{balance.global_bonus_credits}</b>\n'
-        f'• PRO на этом боте до: <b>{html.escape(str(premium_until))}</b>{owner_note}\n'
+        f'• MAX-пак покупается как пакет запросов, без безлимита.{owner_note}\n'
         f'• Доступно сейчас: <b>{available_now}</b>\n'
         f'• Режим доступа: <b>{mode}</b>\n'
         f'• Статус: <b>{status}</b>'
@@ -478,7 +553,7 @@ async def show_premium(
         '⭐ <b>Платные пакеты</b>\n\n'
         f'• Старт-пак — <b>{settings.small_pack_credits}</b> запросов за <b>{settings.small_pack_price}⭐</b>\n'
         f'• Большой пак — <b>{settings.big_pack_credits}</b> запросов за <b>{settings.big_pack_price}⭐</b>\n'
-        f'• PRO 30 дней — безлимит за <b>{settings.pro_30_price}⭐</b>\n\n'
+        f'• MAX-пак — <b>{settings.pro_pack_credits}</b> запросов за <b>{settings.pro_30_price}⭐</b>\n\n'
         f'Покупка будет привязана к боту: <b>{html.escape(seller_name)}</b>.\n'
         'Запросами считаются генерация масок, тексты и подбор стиля. Просмотр примеров масок бесплатный.'
     )
@@ -628,6 +703,11 @@ async def suggest_masks_for_last_photo(message: Message, user_id: int, context: 
         await message.reply_text('Сначала пришли фото, чтобы я подобрал маски именно под него.')
         return
 
+    if await reply_if_ai_unavailable(message, context):
+        bot_id = get_current_bot_id(context)
+        db.save_job(bot_id, user_id, 'suggest', str(photo_path), None, None, 'Подбор стиля', 'failed', 'cached ai outage')
+        return
+
     allowed, reason = await consume_quota_or_offer(message, context, user_id)
     bot_id = get_current_bot_id(context)
     if not allowed:
@@ -641,6 +721,7 @@ async def suggest_masks_for_last_photo(message: Message, user_id: int, context: 
     except Exception as exc:  # noqa: BLE001
         logger.exception('Mask suggestion failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
+        set_ai_outage_cache(context, exc)
         db.save_job(bot_id, user_id, 'suggest', str(photo_path), None, None, 'Подбор стиля', 'failed', str(exc))
         await maybe_notify_admins_about_ai_error(context, user_id, 'suggest', exc)
         await wait_message.edit_text(friendly_ai_error(exc, 'suggest'))
@@ -662,6 +743,10 @@ async def suggest_masks_for_last_photo(message: Message, user_id: int, context: 
 
 async def generate_creative_text(message: Message, user_id: int, context: ContextTypes.DEFAULT_TYPE, kind: str, brief: str) -> None:
     bot_id = get_current_bot_id(context)
+    if await reply_if_ai_unavailable(message, context):
+        db.save_job(bot_id, user_id, 'text', None, None, None, brief, 'failed', 'cached ai outage')
+        return
+
     allowed, reason = await consume_quota_or_offer(message, context, user_id)
     if not allowed:
         db.save_job(bot_id, user_id, 'text', None, None, None, brief, 'denied', 'empty quota')
@@ -674,6 +759,7 @@ async def generate_creative_text(message: Message, user_id: int, context: Contex
     except Exception as exc:  # noqa: BLE001
         logger.exception('Text generation failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
+        set_ai_outage_cache(context, exc)
         db.save_job(bot_id, user_id, 'text', None, None, None, brief, 'failed', str(exc))
         await maybe_notify_admins_about_ai_error(context, user_id, 'text', exc)
         await wait_message.edit_text(friendly_ai_error(exc, 'text'))
@@ -689,18 +775,20 @@ async def generate_creative_text(message: Message, user_id: int, context: Contex
 
 
 async def render_with_preset(message: Message, user_id: int, context: ContextTypes.DEFAULT_TYPE, preset_key: str, stronger: bool) -> None:
-    photo_path = context.user_data.get('last_photo_path')
-    if not photo_path or not Path(photo_path).exists():
-        await message.reply_text('Сначала пришли фото.')
+    source_paths = get_input_photo_paths(context)
+    if not source_paths:
+        await message.reply_text('Сначала загрузи хотя бы одно фото для шаблона.')
         return
     preset = PRESET_BY_KEY[preset_key]
     prompt = preset_edit_prompt(preset, stronger=stronger)
+    if len(source_paths) > 1:
+        prompt += ' Multiple source photos are attached. Combine the people from all uploaded photos into one coherent final scene while preserving each face and identity.'
     await execute_image_render(
         message=message,
         user_id=user_id,
         context=context,
         prompt=prompt,
-        source_path=Path(photo_path),
+        source_paths=source_paths,
         job_type='image_preset',
         preset_key=preset_key,
         stronger=stronger,
@@ -709,17 +797,19 @@ async def render_with_preset(message: Message, user_id: int, context: ContextTyp
 
 
 async def render_custom_mask(message: Message, user_id: int, context: ContextTypes.DEFAULT_TYPE, user_prompt: str, stronger: bool) -> None:
-    photo_path = context.user_data.get('last_photo_path')
-    if not photo_path or not Path(photo_path).exists():
-        await message.reply_text('Сначала пришли фото.')
+    source_paths = get_input_photo_paths(context)
+    if not source_paths:
+        await message.reply_text('Сначала загрузи хотя бы одно фото для своей маски.')
         return
     prompt = custom_edit_prompt(user_prompt, stronger=stronger)
+    if len(source_paths) > 1:
+        prompt += ' Multiple source photos are attached. Combine all uploaded people into one consistent final composition and preserve each identity.'
     await execute_image_render(
         message=message,
         user_id=user_id,
         context=context,
         prompt=prompt,
-        source_path=Path(photo_path),
+        source_paths=source_paths,
         job_type='image_custom',
         preset_key='custom',
         stronger=stronger,
@@ -728,15 +818,20 @@ async def render_custom_mask(message: Message, user_id: int, context: ContextTyp
 
 
 def friendly_ai_error(exc: Exception, mode: str) -> str:
-    raw = str(exc).lower()
     action = 'сгенерировать изображение' if mode == 'image' else ('сгенерировать текст' if mode == 'text' else 'обработать запрос')
-    if 'incorrect api key' in raw or 'invalid api key' in raw or 'authentication' in raw or '401' in raw:
+    code = classify_ai_error(exc)
+    if code == 'billing_hard_limit':
+        return (
+            f'Не удалось {action}: у владельца бота закончился бюджет OpenAI API или достигнут жёсткий лимит расходов. '
+            'Списание автоматически отменено. Попробуй позже или напиши владельцу бота.'
+        )
+    if code == 'invalid_api_key':
         return f'Не удалось {action}: проблема с ключом OpenAI API. Списание автоматически отменено. Проверь OPENAI_API_KEY.'
-    if 'insufficient_quota' in raw or 'billing' in raw or '429' in raw or 'rate limit' in raw or 'quota' in raw:
-        return f'Не удалось {action}: у OpenAI сейчас лимит, квота или платёжная проблема. Списание автоматически отменено.'
-    if 'timed out' in raw or 'timeout' in raw or 'connection' in raw or 'temporarily unavailable' in raw:
+    if code == 'quota_or_rate_limit':
+        return f'Не удалось {action}: у OpenAI сейчас лимит или квота. Списание автоматически отменено.'
+    if code == 'temporary_unavailable':
         return f'Не удалось {action}: AI-сервис не ответил вовремя. Списание автоматически отменено, попробуй ещё раз позже.'
-    if 'model' in raw and ('not found' in raw or 'does not exist' in raw or 'unsupported' in raw or 'permission' in raw or 'access' in raw):
+    if code == 'model_unavailable':
         return f'Не удалось {action}: выбранная AI-модель недоступна для этого ключа. Списание автоматически отменено. Проверь настройки моделей в .env.'
     return f'Не удалось {action}. Списание автоматически отменено, попробуй ещё раз.'
 
@@ -747,12 +842,19 @@ async def maybe_notify_admins_about_ai_error(context: ContextTypes.DEFAULT_TYPE,
     bot_id = get_current_bot_id(context)
     bot_row = db.get_bot(bot_id)
     bot_name = bot_row.title if bot_row else f'bot #{bot_id}'
+    code = classify_ai_error(exc)
+    action_hint = ''
+    if code == 'billing_hard_limit':
+        action_hint = '\nДействие: <b>пополнить баланс / поднять usage limit в OpenAI Platform</b>.'
+    elif code == 'invalid_api_key':
+        action_hint = '\nДействие: <b>заменить OPENAI_API_KEY</b>.'
     text = (
         '⚠️ <b>AI ошибка</b>\n\n'
         f'Бот: <b>{html.escape(bot_name)}</b>\n'
         f'Режим: <b>{html.escape(mode)}</b>\n'
         f'Пользователь: <code>{user_id}</code>\n'
         f'Ошибка: <code>{html.escape(str(exc))[:2500]}</code>'
+        f'{action_hint}'
     )
     for admin_id in settings.admin_user_ids[:3]:
         try:
@@ -766,33 +868,39 @@ async def execute_image_render(
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
-    source_path: Path,
+    source_paths: list[Path],
     job_type: str,
     preset_key: str,
     stronger: bool,
     original_user_prompt: str | None,
 ) -> None:
     bot_id = get_current_bot_id(context)
+    source_repr = ' | '.join(str(path) for path in source_paths)
+    if await reply_if_ai_unavailable(message, context):
+        db.save_job(bot_id, user_id, job_type, source_repr, None, preset_key, original_user_prompt, 'failed', 'cached ai outage')
+        return
+
     allowed, reason = await consume_quota_or_offer(message, context, user_id)
     if not allowed:
-        db.save_job(bot_id, user_id, job_type, str(source_path), None, preset_key, original_user_prompt, 'denied', 'empty quota')
+        db.save_job(bot_id, user_id, job_type, source_repr, None, preset_key, original_user_prompt, 'denied', 'empty quota')
         return
 
     wait_message = await message.reply_text('Генерирую маску, это может занять немного времени...')
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_PHOTO)
     try:
-        result_bytes = await asyncio.to_thread(openai_service.edit_image, source_path, prompt)
+        result_bytes = await asyncio.to_thread(openai_service.edit_image, source_paths, prompt)
     except Exception as exc:  # noqa: BLE001
         logger.exception('Image render failed: %s', exc)
         db.restore_request(bot_id, user_id, reason)
-        db.save_job(bot_id, user_id, job_type, str(source_path), None, preset_key, original_user_prompt, 'failed', str(exc))
+        set_ai_outage_cache(context, exc)
+        db.save_job(bot_id, user_id, job_type, source_repr, None, preset_key, original_user_prompt, 'failed', str(exc))
         await maybe_notify_admins_about_ai_error(context, user_id, 'image', exc)
         await wait_message.edit_text(friendly_ai_error(exc, 'image'))
         return
 
     output_path = settings.result_dir / f'{bot_id}_{user_id}_{uuid.uuid4().hex}.png'
     output_path.write_bytes(result_bytes)
-    db.save_job(bot_id, user_id, job_type, str(source_path), str(output_path), preset_key, original_user_prompt, 'done')
+    db.save_job(bot_id, user_id, job_type, source_repr, str(output_path), preset_key, original_user_prompt, 'done')
 
     balance = db.get_user_balance(bot_id, user_id)
     remaining = balance.total_renders_left if balance else '—'
@@ -885,24 +993,122 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     message = update.effective_message
     if not message:
         return
+
+    current_paths = get_input_photo_paths(context)
+    if len(current_paths) >= MAX_SOURCE_PHOTOS:
+        await message.reply_text(
+            f'Уже загружено максимум {MAX_SOURCE_PHOTOS} фото. Нажми «✅ Отправить в шаблон», «✍️ Написать описание маски» или сначала очисти текущую подборку.',
+            reply_markup=photo_batch_keyboard(can_send=True, mode=str(context.user_data.get('media_mode') or 'preset')),
+        )
+        return
+
     path = await save_incoming_image(message)
-    old_path = context.user_data.get('last_photo_path')
-    if old_path and old_path != str(path):
-        maybe_remove_file(Path(old_path))
-    context.user_data['last_photo_path'] = str(path)
+    current_paths.append(path)
+    set_input_photo_paths(context, current_paths)
     context.user_data['last_edit'] = None
+
+    mode, preset_key, count = media_session_summary(context)
+    photos_left = MAX_SOURCE_PHOTOS - count
+    if mode == 'preset' and preset_key in PRESET_BY_KEY:
+        preset = PRESET_BY_KEY[preset_key]
+        text = (
+            f'📸 Фото {count}/{MAX_SOURCE_PHOTOS} сохранено для шаблона «{preset.title}».\n\n'
+            f'{preset_photo_hint(preset.title)}\n\n'
+            f'Сейчас загружено: <b>{count}</b>. Ещё можно добавить: <b>{photos_left}</b>.'
+        )
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=photo_batch_keyboard(can_send=True, mode='preset'))
+        return
+
+    if mode == 'custom':
+        text = (
+            f'📸 Фото {count}/{MAX_SOURCE_PHOTOS} сохранено для своей маски.\n\n'
+            f'{custom_mask_photo_hint()}\n\n'
+            f'Сейчас загружено: <b>{count}</b>. Ещё можно добавить: <b>{photos_left}</b>.'
+        )
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=photo_batch_keyboard(can_send=True, mode='custom'))
+        return
+
     text = (
-        '📸 Фото сохранено.\n\n'
+        f'📸 Фото {count}/{MAX_SOURCE_PHOTOS} сохранено.\n\n'
         'Теперь можно:\n'
         '• открыть галерею из 30 масок;\n'
         '• придумать свою маску по описанию;\n'
-        '• попросить меня подобрать лучшие стили именно под этот снимок.'
+        '• попросить меня подобрать лучшие стили именно под этот снимок;\n'
+        '• при желании добавить ещё фото — бот умеет объединять до 4 кадров в одну обработку.'
     )
     await message.reply_text(text, reply_markup=quick_after_photo_keyboard())
 
 
 def _root_owner_id() -> int | None:
     return settings.root_owner_user_id
+
+
+def classify_ai_error(exc: Exception) -> str:
+    raw = str(exc).lower()
+    if 'billing_hard_limit_reached' in raw or ('billing' in raw and 'hard limit' in raw):
+        return 'billing_hard_limit'
+    if 'incorrect api key' in raw or 'invalid api key' in raw or 'authentication' in raw or '401' in raw:
+        return 'invalid_api_key'
+    if 'insufficient_quota' in raw or 'rate limit' in raw or 'quota' in raw or '429' in raw:
+        return 'quota_or_rate_limit'
+    if 'timed out' in raw or 'timeout' in raw or 'connection' in raw or 'temporarily unavailable' in raw:
+        return 'temporary_unavailable'
+    if 'model' in raw and ('not found' in raw or 'does not exist' in raw or 'unsupported' in raw or 'permission' in raw or 'access' in raw):
+        return 'model_unavailable'
+    return 'other'
+
+
+def set_ai_outage_cache(context: ContextTypes.DEFAULT_TYPE, exc: Exception) -> None:
+    code = classify_ai_error(exc)
+    if code not in {'billing_hard_limit', 'invalid_api_key'}:
+        return
+    context.application.bot_data['ai_outage'] = {
+        'code': code,
+        'until': time.time() + max(1, settings.ai_outage_cache_minutes) * 60,
+        'raw': str(exc)[:500],
+    }
+
+
+def get_ai_outage(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
+    outage = context.application.bot_data.get('ai_outage')
+    if not isinstance(outage, dict):
+        return None
+    until = float(outage.get('until') or 0)
+    if until <= time.time():
+        context.application.bot_data.pop('ai_outage', None)
+        return None
+    return outage
+
+
+def ai_outage_user_message(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    outage = get_ai_outage(context)
+    if not outage:
+        return None
+    code = str(outage.get('code') or 'other')
+    seconds_left = max(0, int(float(outage.get('until') or 0) - time.time()))
+    minutes_left = max(1, ceil(seconds_left / 60))
+    if code == 'billing_hard_limit':
+        return (
+            '⛔️ AI-сервис временно недоступен.\n\n'
+            'У владельца бота закончился бюджет OpenAI API или достигнут жёсткий лимит расходов. '
+            'Пока это не исправят, новые AI-запросы не отправляются и не списываются.\n\n'
+            f'Следующая автоматическая проверка: примерно через {minutes_left} мин.'
+        )
+    if code == 'invalid_api_key':
+        return (
+            '⛔️ AI-сервис временно недоступен.\n\n'
+            'У бота проблема с ключом OpenAI API. Пока владелец не заменит ключ, новые AI-запросы не отправляются и не списываются.\n\n'
+            f'Следующая автоматическая проверка: примерно через {minutes_left} мин.'
+        )
+    return None
+
+
+async def reply_if_ai_unavailable(message: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    cached_message = ai_outage_user_message(context)
+    if not cached_message:
+        return False
+    await message.reply_text(cached_message)
+    return True
 
 
 def _payout_amount(total_amount: int, permille: int) -> int:
@@ -918,11 +1124,13 @@ def _format_bot_link(bot_row: Any) -> str:
 
 
 async def distribute_commissions(payment_id: int, seller_bot_id: int, amount: int) -> None:
-    chain = db.get_bot_owner_chain(seller_bot_id, max_depth=3)
-    awarded_users: set[int] = set()
-    direct_notes = ['прямая продажа', 'родительская линия', 'уровень 3']
-    permilles = [commission_plan.direct_permille, commission_plan.parent_permille, commission_plan.grandparent_permille]
+    chain = db.get_bot_owner_chain(seller_bot_id, max_depth=2)
+    awarded_users: set[tuple[int, str]] = set()
+    direct_notes = ['прямая продажа', 'корневая линия']
+    permilles = [commission_plan.direct_permille, commission_plan.parent_permille]
     for idx, row in enumerate(chain):
+        if idx >= len(permilles):
+            break
         owner_user_id = row['owner_user_id']
         if owner_user_id is None:
             continue
@@ -930,11 +1138,30 @@ async def distribute_commissions(payment_id: int, seller_bot_id: int, amount: in
         permille = permilles[idx]
         if permille <= 0:
             continue
-        db.record_commission(payment_id, owner_id, seller_bot_id, _payout_amount(amount, permille), idx + 1, direct_notes[idx])
-        awarded_users.add(owner_id)
+        payout = _payout_amount(amount, permille)
+        if payout <= 0:
+            continue
+        db.record_commission(payment_id, owner_id, seller_bot_id, payout, idx + 1, direct_notes[idx])
+        awarded_users.add((owner_id, direct_notes[idx]))
+
+    sponsor_user_id = db.get_bot_sponsor_user_id(seller_bot_id)
     root_owner_id = _root_owner_id()
-    if root_owner_id and root_owner_id not in awarded_users:
-        db.record_commission(payment_id, root_owner_id, seller_bot_id, _payout_amount(amount, commission_plan.platform_permille), 99, 'платформа')
+    seller_owner_id = int(chain[0]['owner_user_id']) if chain and chain[0]['owner_user_id'] is not None else None
+    if (
+        sponsor_user_id
+        and commission_plan.referrer_permille > 0
+        and sponsor_user_id != seller_owner_id
+        and sponsor_user_id != root_owner_id
+    ):
+        payout = _payout_amount(amount, commission_plan.referrer_permille)
+        if payout > 0:
+            db.record_commission(payment_id, sponsor_user_id, seller_bot_id, payout, 3, 'реферальный бонус')
+            awarded_users.add((sponsor_user_id, 'реферальный бонус'))
+
+    if root_owner_id and commission_plan.platform_permille > 0:
+        payout = _payout_amount(amount, commission_plan.platform_permille)
+        if payout > 0:
+            db.record_commission(payment_id, root_owner_id, seller_bot_id, payout, 99, 'платформа')
 
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -987,7 +1214,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         grant_text = f'На баланс выбранного бота зачислено {product["credits"]} запросов.'
     else:
         db.add_bot_premium_days(seller_bot_id, buyer_user_id, int(product['premium_days']))
-        grant_text = f'PRO на выбранном боте активирован на {product["premium_days"]} дней.'
+        grant_text = f'На баланс выбранного бота зачислен MAX-пак.'
 
     await distribute_commissions(payment_id, seller_bot_id, payment.total_amount)
     seller_bot = db.get_bot(seller_bot_id)
@@ -1032,7 +1259,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parts = data.split(':')
         if len(parts) > 2 and parts[2].isdigit():
             parent_bot_id = int(parts[2])
-        context.user_data['create_bot_flow'] = {'step': 'awaiting_token', 'parent_bot_id': parent_bot_id}
+        context.user_data['create_bot_flow'] = {'step': 'awaiting_token', 'ref_source_bot_id': parent_bot_id}
         await query.answer()
         await query.message.reply_text(
             'Отправь токен твоего бота от @BotFather одним сообщением.\n\n'
@@ -1061,8 +1288,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == 'menu:custom_mask':
         await query.answer()
-        context.user_data['awaiting_custom_prompt'] = True
-        await query.message.reply_text('Напиши, какую маску или эффект ты хочешь наложить на последнее фото.')
+        context.user_data['media_mode'] = 'custom'
+        context.user_data.pop('pending_preset_key', None)
+        context.user_data['awaiting_custom_prompt'] = False
+        photo_count = len(get_input_photo_paths(context))
+        if photo_count:
+            await query.message.reply_text(
+                f'У тебя уже загружено фото: <b>{photo_count}</b> из {MAX_SOURCE_PHOTOS}.\n\nНапиши, какую маску или эффект ты хочешь наложить на эти кадры.',
+                parse_mode=ParseMode.HTML,
+                reply_markup=photo_batch_keyboard(can_send=True, mode='custom'),
+            )
+        else:
+            await query.message.reply_text(custom_mask_photo_hint(), reply_markup=photo_batch_keyboard(can_send=False, mode='custom'))
         return
 
     if data == 'menu:suggest':
@@ -1088,8 +1325,68 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not preset:
             await query.answer('Не удалось найти этот пресет.', show_alert=True)
             return
+        context.user_data['media_mode'] = 'preset'
+        context.user_data['pending_preset_key'] = preset_key
+        context.user_data['awaiting_custom_prompt'] = False
+        photo_count = len(get_input_photo_paths(context))
+        await query.answer('Шаблон выбран')
+        if photo_count:
+            await query.message.reply_text(
+                (
+                    f'Выбран шаблон «{preset.title}».\n\n'
+                    f'{preset_photo_hint(preset.title)}\n\n'
+                    f'Сейчас загружено: <b>{photo_count}</b> из {MAX_SOURCE_PHOTOS}.'
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=photo_batch_keyboard(can_send=True, mode='preset'),
+            )
+        else:
+            await query.message.reply_text(preset_photo_hint(preset.title), reply_markup=photo_batch_keyboard(can_send=False, mode='preset'))
+        return
+
+    if data == 'media:send':
+        preset_key = context.user_data.get('pending_preset_key')
+        if not preset_key:
+            await query.answer('Сначала выбери шаблон.', show_alert=True)
+            return
+        if not get_input_photo_paths(context):
+            await query.answer('Сначала загрузи хотя бы одно фото.', show_alert=True)
+            return
         await query.answer('Запускаю рендер...')
-        await render_with_preset(query.message, query.from_user.id, context, preset_key, stronger=False)
+        await render_with_preset(query.message, query.from_user.id, context, str(preset_key), stronger=False)
+        return
+
+    if data == 'media:custom_prompt':
+        if not get_input_photo_paths(context):
+            await query.answer('Сначала загрузи хотя бы одно фото.', show_alert=True)
+            return
+        context.user_data['media_mode'] = 'custom'
+        context.user_data['awaiting_custom_prompt'] = True
+        context.user_data.pop('pending_preset_key', None)
+        await query.answer()
+        await query.message.reply_text('Напиши, какую маску или эффект нужно сделать по этим фото.')
+        return
+
+    if data == 'media:clear':
+        mode = str(context.user_data.get('media_mode') or '')
+        preset_key = context.user_data.get('pending_preset_key')
+        clear_input_photos(context)
+        await query.answer('Фото очищены')
+        if mode == 'preset' and preset_key in PRESET_BY_KEY:
+            await query.message.reply_text(
+                f'Фото очищены. Пришли новые кадры для шаблона «{PRESET_BY_KEY[preset_key].title}».',
+                reply_markup=photo_batch_keyboard(can_send=False, mode='preset'),
+            )
+        elif mode == 'custom':
+            await query.message.reply_text('Фото очищены. Пришли новые кадры для своей маски.', reply_markup=photo_batch_keyboard(can_send=False, mode='custom'))
+        else:
+            await query.message.reply_text('Фото очищены. Можешь прислать новую подборку.', reply_markup=reply_menu(context, query.from_user.id))
+        return
+
+    if data == 'media:cancel':
+        reset_media_session(context, clear_photos=True)
+        await query.answer('Действие отменено')
+        await query.message.reply_text('Загрузка фото отменена. Можно начать заново в любое время.', reply_markup=reply_menu(context, query.from_user.id))
         return
 
     if data == 'rerun:strong':
@@ -1210,7 +1507,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def send_admin_menu(message: Message) -> None:
     text = (
         '🛡 <b>Панель сети</b>\n\n'
-        'Здесь ты видишь всю иерархию дочерних ботов, пользователей, продажи, комиссии и подозрительные аккаунты.'
+        'Здесь ты видишь корневой бот, всех прямых дочерних ботов, пользователей, продажи, комиссии и подозрительные аккаунты.'
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_menu_keyboard())
 
@@ -1245,7 +1542,11 @@ async def send_admin_tree(message: Message) -> None:
         indent = '   ' * int(row['depth'])
         owner = mention_html(row['owner_user_id'], row['owner_first_name'], row['owner_username']) if row['owner_user_id'] else 'корневой бот'
         username = '@' + row['username'] if row['username'] else 'без username'
-        lines.append(f'{indent}{prefix}<b>{html.escape(row["title"])}</b> ({html.escape(username)}) — {owner}')
+        sponsor = ''
+        if row['sponsor_user_id']:
+            sponsor_label = ('@' + row['sponsor_username']) if row['sponsor_username'] else (row['sponsor_first_name'] or str(row['sponsor_user_id']))
+            sponsor = f' | реф: <b>{html.escape(sponsor_label)}</b>'
+        lines.append(f'{indent}{prefix}<b>{html.escape(row["title"])}</b> ({html.escape(username)}) — {owner}{sponsor}')
     await message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_menu_keyboard(), disable_web_page_preview=True)
 
 
@@ -1350,7 +1651,7 @@ async def send_admin_user_detail(message: Message, user_id: int, back_page: int)
         username = '@' + membership['bot_username'] if membership['bot_username'] else 'без username'
         premium_lines.append(
             f'• <b>{html.escape(membership["bot_title"])}</b> ({html.escape(username)}){owner_badge}: '
-            f'free <b>{membership["free_trial_left"]}</b>, paid <b>{membership["paid_credits"]}</b>, owner/day <b>{membership["owner_daily_left"]}</b>, PRO <b>{html.escape(str(prem))}</b>'
+            f'бесплатно <b>{membership["free_trial_left"]}</b>, платно <b>{membership["paid_credits"]}</b>, владелец/день <b>{membership["owner_daily_left"]}</b>, спец-доступ до <b>{html.escape(str(prem))}</b>'
         )
     if not premium_lines:
         premium_lines.append('• У пользователя пока нет активностей по ботам.')
@@ -1398,10 +1699,14 @@ async def send_admin_bots_page(message: Message, page: int) -> None:
         for idx, row in enumerate(rows, start=page * BOTS_PER_PAGE + 1):
             owner = mention_html(row['owner_user_id'], row['owner_first_name'], row['owner_username']) if row['owner_user_id'] else '—'
             username = '@' + row['username'] if row['username'] else 'без username'
-            parent_title = html.escape(row['parent_title'] or 'root')
+            parent_title = html.escape(row['parent_title'] or 'корневой бот')
+            sponsor = ''
+            if row['sponsor_user_id']:
+                sponsor_name = '@' + row['sponsor_username'] if row['sponsor_username'] else (row['sponsor_first_name'] or str(row['sponsor_user_id']))
+                sponsor = f'; реф: <b>{html.escape(sponsor_name)}</b>'
             lines.append(
                 f'{idx}. <b>{html.escape(row["title"])}</b> ({html.escape(username)})\n'
-                f'   владелец: {owner}; parent: <b>{parent_title}</b>\n'
+                f'   владелец: {owner}; родитель: <b>{parent_title}</b>{sponsor}\n'
                 f'   участники: <b>{row["members_count"]}</b>, запросы: <b>{row["jobs_count"]}</b>, продажи: <b>{row["sales_count"]}</b>, доход: <b>{row["stars_revenue"]}</b>⭐'
             )
             buttons.append([InlineKeyboardButton('🤖 Открыть карточку', callback_data=f'admin:bot:{row["id"]}:{page}')])
@@ -1423,7 +1728,10 @@ async def send_admin_bot_detail(message: Message, bot_id: int, back_page: int) -
         return
     owner = mention_html(row['owner_user_id'], row['owner_first_name'], row['owner_username']) if row['owner_user_id'] else '—'
     username = '@' + row['username'] if row['username'] else 'без username'
-    parent = row['parent_title'] or 'root'
+    parent = row['parent_title'] or 'корневой бот'
+    sponsor = '—'
+    if row['sponsor_user_id']:
+        sponsor = '@' + row['sponsor_username'] if row['sponsor_username'] else (row['sponsor_first_name'] or str(row['sponsor_user_id']))
     text = (
         '🤖 <b>Карточка дочернего бота</b>\n\n'
         f'Название: <b>{html.escape(row["title"])}</b>\n'
@@ -1431,6 +1739,7 @@ async def send_admin_bot_detail(message: Message, bot_id: int, back_page: int) -
         f'ID в сети: <code>{row["id"]}</code>\n'
         f'Владелец: {owner}\n'
         f'Родитель: <b>{html.escape(parent)}</b>\n'
+        f'Реферальный источник: <b>{html.escape(sponsor)}</b>\n'
         f'Статус: <b>{html.escape(row["status"])}</b>\n'
         f'Бесплатно для юзера: <b>{row["user_free_trial"]}</b>\n'
         f'Владелец / день: <b>{row["owner_daily_free"]}</b>\n'
@@ -1517,7 +1826,7 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
             instance = await runtime.register_child_bot(
                 token=flow['token'],
                 owner_user_id=message.from_user.id,
-                parent_bot_id=flow.get('parent_bot_id'),
+                ref_source_bot_id=flow.get('ref_source_bot_id'),
                 desired_title=desired_title,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1543,8 +1852,8 @@ async def handle_create_bot_flow(message: Message, context: ContextTypes.DEFAULT
             f'Что дальше:\n'
             f'1) Открой своего бота и нажми <code>/start</code>.\n'
             f'2) При желании настрой имя и аватар у BotFather.\n'
-            f'3) Премиум для твоих пользователей будет продаваться через {html.escape(root_name)}.\n'
-            f'4) Тебе как владельцу доступно <b>{settings.child_owner_daily_free} бесплатных запросов в день</b>.\n\n'
+            f'3) Пакеты запросов для твоих пользователей будут продаваться через {html.escape(root_name)}.\n'
+            f'4) Твой дневной бонус как владельца: <b>{settings.child_owner_daily_free}</b> запрос в день.\n\n'
             'Подключение завершено.'
         )
         await message.reply_text(text_reply, parse_mode=ParseMode.HTML, reply_markup=reply_menu(context, message.from_user.id if message.from_user else None))
@@ -1594,15 +1903,31 @@ async def text_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
     if await handle_create_bot_flow(message, context, text):
         return
 
+    if text.lower() in {'отмена', 'cancel', 'стоп', '❌ отмена'}:
+        mode = context.user_data.get('media_mode')
+        has_photos = bool(get_input_photo_paths(context))
+        if mode or has_photos or context.user_data.get('awaiting_custom_prompt'):
+            reset_media_session(context, clear_photos=True)
+            await message.reply_text('Текущая загрузка фото отменена. Можно начать заново.', reply_markup=reply_menu(context, update.effective_user.id))
+            return
+
     if text in {'✨ Маски', '✨ Маски-галерея', '🖼 Примеры масок'}:
         await send_gallery_page(message, 0)
         return
     if text in {'✨ Маска по тексту', '🎨 Маска по описанию'}:
-        if not context.user_data.get('last_photo_path'):
-            await message.reply_text('Сначала пришли фото, затем опиши свою маску.', reply_markup=reply_menu(context, update.effective_user.id))
+        context.user_data['media_mode'] = 'custom'
+        context.user_data.pop('pending_preset_key', None)
+        context.user_data['awaiting_custom_prompt'] = False
+        photo_count = len(get_input_photo_paths(context))
+        if not photo_count:
+            await message.reply_text(custom_mask_photo_hint(), reply_markup=photo_batch_keyboard(can_send=False, mode='custom'))
             return
         context.user_data['awaiting_custom_prompt'] = True
-        await message.reply_text('Напиши, какую маску или эффект ты хочешь наложить на фото.')
+        await message.reply_text(
+            f'У тебя уже загружено фото: <b>{photo_count}</b> из {MAX_SOURCE_PHOTOS}.\n\nНапиши, какую маску или эффект ты хочешь наложить на эти кадры.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=photo_batch_keyboard(can_send=True, mode='custom'),
+        )
         return
     if text in {'🖼 Подсказать маски', '🪄 Подобрать стиль'}:
         await suggest_masks_for_last_photo(message, update.effective_user.id, context)

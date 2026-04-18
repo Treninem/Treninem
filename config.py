@@ -28,6 +28,7 @@ class Settings:
     big_pack_price: int
     big_pack_credits: int
     pro_30_price: int
+    pro_pack_credits: int
     pro_30_days: int
     request_timeout_seconds: int
     admin_user_ids: tuple[int, ...]
@@ -36,15 +37,16 @@ class Settings:
     suspicious_burst_window_minutes: int
     direct_commission_permille: int
     parent_commission_permille: int
-    grandparent_commission_permille: int
+    referrer_commission_permille: int
     platform_commission_permille: int
+    ai_outage_cache_minutes: int
 
 
 @dataclass(frozen=True)
 class CommissionPlan:
     direct_permille: int
     parent_permille: int
-    grandparent_permille: int
+    referrer_permille: int
     platform_permille: int
 
 
@@ -68,7 +70,7 @@ def load_settings() -> Settings:
     root_owner_raw = os.getenv('ROOT_OWNER_USER_ID', '').strip()
     root_owner_user_id = int(root_owner_raw) if root_owner_raw.isdigit() else (admin_user_ids[0] if admin_user_ids else None)
 
-    free_trial = os.getenv('FREE_TRIAL_REQUESTS') or os.getenv('FREE_TRIAL_CREDITS') or '5'
+    free_trial = os.getenv('FREE_TRIAL_REQUESTS') or os.getenv('FREE_TRIAL_CREDITS') or '1'
 
     settings = Settings(
         telegram_bot_token=telegram_bot_token,
@@ -81,22 +83,24 @@ def load_settings() -> Settings:
         result_dir=Path(os.getenv('RESULT_DIR', BASE_DIR / 'data' / 'results')),
         preview_dir=Path(os.getenv('PREVIEW_DIR', BASE_DIR)),
         free_trial_credits=int(free_trial),
-        child_owner_daily_free=int(os.getenv('CHILD_OWNER_DAILY_FREE', '10')),
-        small_pack_price=int(os.getenv('STARS_SMALL_PACK_PRICE', '79')),
-        small_pack_credits=int(os.getenv('SMALL_PACK_CREDITS', '5')),
-        big_pack_price=int(os.getenv('STARS_BIG_PACK_PRICE', '199')),
-        big_pack_credits=int(os.getenv('BIG_PACK_CREDITS', '15')),
-        pro_30_price=int(os.getenv('STARS_PRO30_PRICE', '449')),
+        child_owner_daily_free=int(os.getenv('CHILD_OWNER_DAILY_FREE', '1')),
+        small_pack_price=int(os.getenv('STARS_SMALL_PACK_PRICE', '99')),
+        small_pack_credits=int(os.getenv('SMALL_PACK_CREDITS', '4')),
+        big_pack_price=int(os.getenv('STARS_BIG_PACK_PRICE', '249')),
+        big_pack_credits=int(os.getenv('BIG_PACK_CREDITS', '12')),
+        pro_30_price=int(os.getenv('STARS_PRO30_PRICE', '599')),
+        pro_pack_credits=int(os.getenv('PRO_PACK_CREDITS', '35')),
         pro_30_days=int(os.getenv('PRO_30_DAYS', '30')),
         request_timeout_seconds=int(os.getenv('REQUEST_TIMEOUT_SECONDS', '180')),
         admin_user_ids=admin_user_ids,
         root_owner_user_id=root_owner_user_id,
         suspicious_burst_limit=int(os.getenv('SUSPICIOUS_BURST_LIMIT', '8')),
         suspicious_burst_window_minutes=int(os.getenv('SUSPICIOUS_BURST_WINDOW_MINUTES', '10')),
-        direct_commission_permille=int(os.getenv('DIRECT_COMMISSION_PERMILLE', '200')),
-        parent_commission_permille=int(os.getenv('PARENT_COMMISSION_PERMILLE', '70')),
-        grandparent_commission_permille=int(os.getenv('GRANDPARENT_COMMISSION_PERMILLE', '30')),
-        platform_commission_permille=int(os.getenv('PLATFORM_COMMISSION_PERMILLE', '100')),
+        direct_commission_permille=int(os.getenv('DIRECT_COMMISSION_PERMILLE', '120')),
+        parent_commission_permille=int(os.getenv('PARENT_COMMISSION_PERMILLE', '50')),
+        referrer_commission_permille=int(os.getenv('REFERRER_COMMISSION_PERMILLE', os.getenv('GRANDPARENT_COMMISSION_PERMILLE', '30'))),
+        platform_commission_permille=int(os.getenv('PLATFORM_COMMISSION_PERMILLE', '80')),
+        ai_outage_cache_minutes=int(os.getenv('AI_OUTAGE_CACHE_MINUTES', '10')),
     )
 
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +114,6 @@ def get_commission_plan(settings: Settings) -> CommissionPlan:
     return CommissionPlan(
         direct_permille=settings.direct_commission_permille,
         parent_permille=settings.parent_commission_permille,
-        grandparent_permille=settings.grandparent_commission_permille,
+        referrer_permille=settings.referrer_commission_permille,
         platform_permille=settings.platform_commission_permille,
     )
