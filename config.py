@@ -40,6 +40,7 @@ class Settings:
     referrer_commission_permille: int
     platform_commission_permille: int
     ai_outage_cache_minutes: int
+    owner_contact_username: str
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ def load_settings() -> Settings:
         referrer_commission_permille=int(os.getenv('REFERRER_COMMISSION_PERMILLE', os.getenv('GRANDPARENT_COMMISSION_PERMILLE', '30'))),
         platform_commission_permille=int(os.getenv('PLATFORM_COMMISSION_PERMILLE', '80')),
         ai_outage_cache_minutes=int(os.getenv('AI_OUTAGE_CACHE_MINUTES', '10')),
+        owner_contact_username=os.getenv('OWNER_CONTACT_USERNAME', '@Treninem').strip(),
     )
 
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)

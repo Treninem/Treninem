@@ -204,6 +204,12 @@ class Database:
                     FOREIGN KEY(beneficiary_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
                     FOREIGN KEY(source_bot_id) REFERENCES bot_instances(id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT NOT NULL
+                );
                 '''
             )
             columns = {row['name'] for row in conn.execute("PRAGMA table_info(bot_instances)").fetchall()}
@@ -459,6 +465,39 @@ class Database:
                 'INSERT INTO usage_events (user_id, event_type, subject, details, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
                 (user_id, 'admin', 'platform_vip_on' if enabled else 'platform_vip_off', note, 'done', now),
             )
+
+    def set_meta(self, key: str, value: str | None) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO app_meta (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                ''',
+                (key, value, now),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute('SELECT value FROM app_meta WHERE key = ?', (key,)).fetchone()
+        if not row:
+            return None
+        value = row['value']
+        return str(value).strip() if value is not None else None
+
+    def set_support_admin_username(self, username: str | None) -> None:
+        normalized = (username or '').strip().lstrip('@') or None
+        self.set_meta('support_admin_username', normalized)
+
+    def get_support_admin_username(self) -> str | None:
+        raw = self.get_meta('support_admin_username')
+        if not raw:
+            return None
+        return str(raw).strip().lstrip('@') or None
+
 
     def adjust_global_bonus_credits(self, user_id: int, delta: int, details: str | None = None) -> int:
         now = self._now()

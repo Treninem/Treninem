@@ -337,6 +337,58 @@ def current_root_username() -> str:
     return runtime.root_username
 
 
+def _normalize_public_username(raw: str | None) -> str | None:
+    value = (raw or '').strip()
+    if not value:
+        return None
+    value = value.lstrip('@').strip()
+    if not value:
+        return None
+    if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', value):
+        return None
+    return value
+
+
+def owner_contact_handle() -> str | None:
+    username = _normalize_public_username(settings.owner_contact_username)
+    return f'@{username}' if username else None
+
+
+def support_admin_handle() -> str | None:
+    username = _normalize_public_username(db.get_support_admin_username())
+    return f'@{username}' if username else None
+
+
+def support_contacts_plain() -> str:
+    lines: list[str] = []
+    owner = owner_contact_handle()
+    admin = support_admin_handle()
+    if owner:
+        lines.append(f'Владелец бота: {owner}')
+    if admin:
+        lines.append(f'Администратор: {admin}')
+    return '\n'.join(lines)
+
+
+def support_contacts_html() -> str:
+    lines: list[str] = []
+    owner = owner_contact_handle()
+    admin = support_admin_handle()
+    if owner:
+        lines.append(f'Владелец бота: <b>{html.escape(owner)}</b>')
+    if admin:
+        lines.append(f'Администратор: <b>{html.escape(admin)}</b>')
+    return '\n'.join(lines)
+
+
+def append_support_contacts(text_value: str, *, html_mode: bool = False) -> str:
+    contacts = support_contacts_html() if html_mode else support_contacts_plain()
+    if not contacts:
+        return text_value
+    return f'{text_value}\n\n{contacts}'
+
+
+
 def access_mode_label(user_id: int, balance) -> str:
     if is_admin_user(user_id):
         return 'корневой владелец / безлимит'
@@ -384,7 +436,7 @@ async def blocked_if_banned(update: Update) -> bool:
     if not db.is_banned_global(user.id):
         return False
 
-    text = 'Твой доступ ко всей сети ботов ограничен администратором.'
+    text = append_support_contacts('Твой доступ ко всей сети ботов ограничен администратором.')
     try:
         if update.callback_query:
             await update.callback_query.answer('Доступ ограничен', show_alert=True)
@@ -412,7 +464,7 @@ async def send_create_bot_intro(message: Message, parent_bot_id: int | None = No
         '• админ-панель сети есть только у корневого владельца.\n\n'
         'Нажми кнопку ниже, чтобы начать мастер подключения.'
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=create_bot_keyboard(parent_bot_id))
+    await message.reply_text(append_support_contacts(text, html_mode=True), parse_mode=ParseMode.HTML, reply_markup=create_bot_keyboard(parent_bot_id))
 
 
 async def explain_how_it_works(message: Message, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,7 +489,7 @@ async def explain_how_it_works(message: Message, context: ContextTypes.DEFAULT_T
             'Этот бот подключён к платформе.\n'
             'Если хочешь такой же бот для себя, нажми «Создать такого же бота».\n'
         )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_menu(context, message.from_user.id if message.from_user else None))
+    await message.reply_text(append_support_contacts(text, html_mode=True), parse_mode=ParseMode.HTML, reply_markup=reply_menu(context, message.from_user.id if message.from_user else None))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -821,19 +873,28 @@ def friendly_ai_error(exc: Exception, mode: str) -> str:
     action = 'сгенерировать изображение' if mode == 'image' else ('сгенерировать текст' if mode == 'text' else 'обработать запрос')
     code = classify_ai_error(exc)
     if code == 'billing_hard_limit':
-        return (
+        return append_support_contacts(
             f'Не удалось {action}: у владельца бота закончился бюджет OpenAI API или достигнут жёсткий лимит расходов. '
             'Списание автоматически отменено. Попробуй позже или напиши владельцу бота.'
         )
     if code == 'invalid_api_key':
-        return f'Не удалось {action}: проблема с ключом OpenAI API. Списание автоматически отменено. Проверь OPENAI_API_KEY.'
+        return append_support_contacts(
+            f'Не удалось {action}: проблема с ключом OpenAI API. Списание автоматически отменено. Проверь OPENAI_API_KEY.'
+        )
     if code == 'quota_or_rate_limit':
-        return f'Не удалось {action}: у OpenAI сейчас лимит или квота. Списание автоматически отменено.'
+        return append_support_contacts(
+            f'Не удалось {action}: у OpenAI сейчас лимит или квота. Списание автоматически отменено.'
+        )
     if code == 'temporary_unavailable':
-        return f'Не удалось {action}: AI-сервис не ответил вовремя. Списание автоматически отменено, попробуй ещё раз позже.'
+        return append_support_contacts(
+            f'Не удалось {action}: AI-сервис не ответил вовремя. Списание автоматически отменено, попробуй ещё раз позже.'
+        )
     if code == 'model_unavailable':
-        return f'Не удалось {action}: выбранная AI-модель недоступна для этого ключа. Списание автоматически отменено. Проверь настройки моделей в .env.'
-    return f'Не удалось {action}. Списание автоматически отменено, попробуй ещё раз.'
+        return append_support_contacts(
+            f'Не удалось {action}: выбранная AI-модель недоступна для этого ключа. Списание автоматически отменено. Проверь настройки моделей в .env.'
+        )
+    return append_support_contacts(f'Не удалось {action}. Списание автоматически отменено, попробуй ещё раз.')
+
 
 
 async def maybe_notify_admins_about_ai_error(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str, exc: Exception) -> None:
@@ -1088,19 +1149,20 @@ def ai_outage_user_message(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     seconds_left = max(0, int(float(outage.get('until') or 0) - time.time()))
     minutes_left = max(1, ceil(seconds_left / 60))
     if code == 'billing_hard_limit':
-        return (
+        return append_support_contacts(
             '⛔️ AI-сервис временно недоступен.\n\n'
             'У владельца бота закончился бюджет OpenAI API или достигнут жёсткий лимит расходов. '
             'Пока это не исправят, новые AI-запросы не отправляются и не списываются.\n\n'
             f'Следующая автоматическая проверка: примерно через {minutes_left} мин.'
         )
     if code == 'invalid_api_key':
-        return (
+        return append_support_contacts(
             '⛔️ AI-сервис временно недоступен.\n\n'
             'У бота проблема с ключом OpenAI API. Пока владелец не заменит ключ, новые AI-запросы не отправляются и не списываются.\n\n'
             f'Следующая автоматическая проверка: примерно через {minutes_left} мин.'
         )
     return None
+
 
 
 async def reply_if_ai_unavailable(message: Message, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1417,6 +1479,25 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE, data:
     if data == 'admin:commissions':
         await send_admin_commissions(query.message)
         return
+    if data == 'admin:support':
+        await send_admin_support_contacts(query.message)
+        return
+    if data == 'admin:support:set':
+        context.user_data['admin_pending_support_username'] = True
+        await query.message.reply_text(
+            'Пришли username администратора поддержки одним сообщением.\n'
+            'Пример: <code>@helper_name</code> или <code>helper_name</code>.\n'
+            'Чтобы убрать контакт, нажми кнопку «Удалить администратора» или отправь «❌ Отмена».',
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_flow_keyboard(),
+        )
+        return
+    if data == 'admin:support:clear':
+        db.set_support_admin_username(None)
+        context.user_data.pop('admin_pending_support_username', None)
+        await query.message.reply_text('Контакт администратора поддержки очищен.')
+        await send_admin_support_contacts(query.message)
+        return
     if data.startswith('admin:users:'):
         await send_admin_users_page(query.message, int(data.split(':')[-1]))
         return
@@ -1435,7 +1516,7 @@ async def handle_admin_callback(query, context: ContextTypes.DEFAULT_TYPE, data:
         _, _, user_id, back_page = data.split(':')
         db.ban_global_user(int(user_id), 'Заблокирован из панели сети')
         try:
-            await runtime.send_root_message(int(user_id), '⛔ Твой доступ ко всей сети ботов ограничен администратором.')
+            await runtime.send_root_message(int(user_id), append_support_contacts('⛔ Твой доступ ко всей сети ботов ограничен администратором.'))
         except Exception:
             pass
         await query.message.reply_text(f'Пользователь {user_id} заблокирован во всей сети.')
@@ -1898,6 +1979,28 @@ async def text_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
         await send_admin_user_detail(message, target_user_id, back_page)
+        return
+
+    if bot_instance.kind == 'root' and is_admin_user(update.effective_user.id) and context.user_data.get('admin_pending_support_username'):
+        if text.lower() in {'отмена', 'cancel', 'стоп', '❌ отмена'}:
+            context.user_data.pop('admin_pending_support_username', None)
+            await message.reply_text('Изменение контакта администратора отменено.', reply_markup=reply_menu(context, update.effective_user.id))
+            return
+        normalized = _normalize_public_username(text)
+        if not normalized:
+            await message.reply_text(
+                'Пришли корректный username Telegram. Пример: <code>@helper_name</code> или <code>helper_name</code>.\nДля отмены нажми «❌ Отмена».',
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_flow_keyboard(),
+            )
+            return
+        db.set_support_admin_username(normalized)
+        context.user_data.pop('admin_pending_support_username', None)
+        await message.reply_text(
+            f'Контакт администратора поддержки сохранён: <b>@{html.escape(normalized)}</b>.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_menu(context, update.effective_user.id),
+        )
         return
 
     if await handle_create_bot_flow(message, context, text):

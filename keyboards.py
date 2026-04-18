@@ -161,6 +161,7 @@ def admin_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton('🎭 Топ масок', callback_data='admin:masks')],
             [InlineKeyboardButton('🔎 Топ запросов', callback_data='admin:prompts')],
             [InlineKeyboardButton('💸 Комиссии', callback_data='admin:commissions')],
+            [InlineKeyboardButton('👤 Контакты поддержки', callback_data='admin:support')],
             [InlineKeyboardButton('🚨 Подозрительные', callback_data='admin:flags:0')],
         ]
     )
